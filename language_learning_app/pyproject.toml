@@ -31,4 +31,7 @@ include = ["cy_utils"]
 [tool.cibuildwheel]
 build = "cp312-*"
 archs = ["auto"]
-CIBW_ARCHS_LINUX = "aarch64"
+
+# Linux-specific configuration
+[tool.cibuildwheel.linux]
+archs = ["aarch64"]
