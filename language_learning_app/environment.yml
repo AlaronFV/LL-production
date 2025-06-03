@@ -1,0 +1,17 @@
+name: i_plus_one_env
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - numpy>=1.20 # Still a runtime dependency
+  - streamlit=1.45.1
+  - heapdict
+  - spacy
+  - regex
+  - orjson
+  - pip
+  - pip:
+    - ./wheels/i_plus_one-0.1.0-cp312-cp312-manylinux_aarch64.whl
+    - https://huggingface.co/latincy/la_core_web_lg/resolve/main/la_core_web_lg-3.8.0-py3-none-any.whl

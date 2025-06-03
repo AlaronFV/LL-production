@@ -1,0 +1,34 @@
+# pyproject.toml
+[build-system]
+requires = [
+  "setuptools>=80.0",
+  "wheel",
+  "Cython>=0.29",     # needed to compile your .pyx
+  "numpy>=1.20"       # needed for numpy.get_include()
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "i_plus_one"
+version = "0.1.0"
+description = "Language Learning App"
+requires-python = ">=3.12"
+# your runtime deps:
+dependencies = [
+  "streamlit==1.45.1",
+  "numpy>=1.20",
+  "heapdict",
+  "spacy",
+  "regex",
+  "orjson",
+]
+
+# tell setuptools to find your packages
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cy_utils"]
+
+[tool.cibuildwheel]
+build = "cp312-*"
+archs = ["auto"]
+CIBW_ARCHS_LINUX = "aarch64"
