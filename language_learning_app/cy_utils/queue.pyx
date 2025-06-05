@@ -1,17 +1,41 @@
-# cy_utils/queue.pyx
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: wraparound=False
 
 from cy_utils.vocab_model cimport VocabularyModel
-from cy_utils.llmodel cimport predict_answer, calculate_unknownness
-import heapdict
+from cy_utils.llmodel cimport predict_answer_for_queue, calculate_unknownness
 import itertools
 cimport numpy as np
 from collections import defaultdict
 from datetime import datetime
 
-from cy_utils.queue cimport LearningQueue
+# NEW: C++ containers and types
+from libcpp.unordered_map cimport unordered_map
+from libcpp.vector cimport vector
+from libcpp.deque cimport deque
+from libcpp.string cimport string
+from libcpp.unordered_set cimport unordered_set
+from libcpp.queue cimport priority_queue
+from libcpp.functional cimport greater
+from libcpp.utility cimport pair
+
+# Threading specific imports
+from libcpp.thread cimport thread
+from libcpp.mutex cimport mutex
+from libcpp.condition_variable cimport condition_variable
+from libcpp.chrono cimport milliseconds # For potential sleep/timeout
+
+from cython.operator cimport dereference as deref
+
+from cy_utils.queue cimport LearningQueue, HeapItem # Import self for type hinting within C++ function
+
+# Custom comparator for the priority queue (defined in pxd)
+cdef cppclass HeapComparator:
+    bint operator()(const HeapItem& a, const HeapItem& b) const:
+        if a.key != b.key:
+            return a.key > b.key
+        return a.insertion_order > b.insertion_order
+
 
 cdef class LearningQueue:
     """
@@ -22,196 +46,425 @@ cdef class LearningQueue:
         self.master    = master
         self.lang      = lang
         self.tmodel    = master.get_or_create_model(lang)
-        self.heaps     = {
-            0.0: heapdict.heapdict(),
-            0.5: heapdict.heapdict(),
-            1.0: heapdict.heapdict()
-        }
+        
+        self._heaps_cpp = unordered_map[int, priority_queue[HeapItem, vector[HeapItem], HeapComparator]]()
+        self._heaps_cpp[0] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+        self._heaps_cpp[1] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+        self._heaps_cpp[2] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+
         self.items     = {}
         self.i2g       = {}
-        self.words_map = {}
-        self.sent_map  = {}
-        self.inverted  = defaultdict(set)
+
+        self._words_map_v_cpp = unordered_map[string, int]()
+        self._words_map_i_cpp = unordered_map[string, unordered_set[int]]()
+        self._sent_map_cpp = unordered_map[int, float]()
+
+        self.inverted_cpp = unordered_map[uint32_t, vector[int]]()
+        
         self.counter   = itertools.count()
+        
+        self._dirty_items = deque[int]()
+
+        # NEW: Threading related initializations
+        self._worker_thread = NULL # Initialize pointer to NULL
+        self._worker_running = False
+        self._worker_paused = False
+        self._is_processing_dirty = False # Flag to indicate if worker is actively processing dirty items
+
+        # Start the worker thread immediately
+        self._start_worker_thread()
+
+    def __dealloc__(self):
+        # Ensure worker thread is stopped and joined when object is deallocated
+        self._stop_worker_thread()
+
+    cdef void _start_worker_thread(self):
+        if not self._worker_running:
+            self._worker_running = True
+            # Pass 'self' to the C++ thread function to allow it to call methods
+            self._worker_thread = new thread(self._background_dirty_processor_thread_func, self)
+
+    cdef void _stop_worker_thread(self):
+        if self._worker_running:
+            with nogil: # Acquire lock without GIL
+                self._worker_running = False # Signal worker to stop
+                self._dirty_queue_cv.notify_all() # Wake up worker if it's waiting
+            if self._worker_thread.joinable(): # Check if joinable before joining
+                self._worker_thread.join() # Wait for worker to finish
+            del self._worker_thread # Delete the thread object
+            self._worker_thread = NULL
+            self._worker_running = False
+
+    cdef void _signal_worker_pause(self):
+        with self._dirty_queue_mutex: # Protect the flag
+            self._worker_paused = True
+            # No need to notify here, worker will check _worker_paused in its loop or on next wait
+
+    cdef void _signal_worker_resume(self):
+        with self._dirty_queue_mutex: # Protect the flag
+            self._worker_paused = False
+            self._dirty_queue_cv.notify_one() # Wake up worker
+
+    cdef void _wait_for_worker_to_pause(self):
+        # This is called by the main thread to ensure the worker is not processing
+        # when the main thread needs to modify shared data.
+        with self._dirty_queue_mutex:
+            while self._is_processing_dirty: # Wait while worker is actively processing
+                self._dirty_queue_cv.wait(self._dirty_queue_mutex)
+
+    cdef void _background_dirty_processor_thread_func(self, LearningQueue self):
+        # This function runs in a C++ thread, so it starts without the GIL
+        cdef int items_to_process_per_batch = 20 # Configurable batch size
+        cdef int processed_count
+        cdef int iid_to_process
+        cdef bint item_exists
+
+        while True:
+            # Lock to check state and access dirty queue
+            with self._dirty_queue_mutex:
+                # Wait if paused or if queue is empty and not stopping
+                # Use std::unique_lock for condition_variable
+                cdef unique_lock[mutex] lock(self._dirty_queue_mutex)
+                while (self._worker_paused or self._dirty_items.empty()) and self._worker_running:
+                    self._dirty_queue_cv.wait(lock)
+                
+                if not self._worker_running: # Check stop signal after waking up
+                    break # Exit thread loop
+
+                self._is_processing_dirty = True # Indicate processing is active
+
+            # Process a batch of items (release GIL for C++ deque ops)
+            processed_count = 0
+            while processed_count < items_to_process_per_batch:
+                item_exists = False
+
+                with self._dirty_queue_mutex: # Protect _dirty_items for front/pop_front
+                    if self._dirty_items.empty() or self._worker_paused:
+                        break # No more items or paused, break from batch processing
+                    iid_to_process = self._dirty_items.front()
+                    self._dirty_items.pop_front()
+                
+                # Acquire GIL for Python object access and method calls
+                with gil:
+                    if iid_to_process in self.items:
+                        # Call update_item directly, passing iid_to_process
+                        self.update_item(iid_to_process, datetime.now().timestamp() / 3600.0)
+                        item_exists = True
+                    else:
+                        item_exists = False # Item was removed by other means
+
+                if item_exists:
+                    processed_count += 1
+                
+                # Small pause to yield control, if needed (optional, GIL release/acquire already yields)
+                # std::this_thread::sleep_for(milliseconds(1)); # Requires <chrono> and <thread>
+
+            with self._dirty_queue_mutex: # Re-acquire lock to update processing status
+                self._is_processing_dirty = False # Indicate processing is done for this batch
+                # If queue is empty after this batch, notify main thread if it's waiting for queue to empty
+                if self._dirty_items.empty():
+                    self._dirty_queue_cv.notify_all()
+
+        # Thread is stopping
+        pass
 
     cpdef void add_item(self,
-                        object item,
-                        int iid,
-                        object promo_data,
-                        double now_h):
+                         object item,
+                         int iid,
+                         double now_h):
         """
         Score a single item and push it into the appropriate heap.
         """
-        cdef float grp, key
-        grp, key = self._score_and_group(item, promo_data, now_h)
+        cdef int grp
+        cdef float key
 
-        # store
+        # Call _score_and_group directly, accessing maps from self
+        grp, key = self._score_and_group(item, iid, now_h)
+
         self.items[iid] = item
-        # invert index by word
-        for w in item["unit"]["words"]:
-            self.inverted[w].add(iid)
-        # push into heap
+        cdef str w_str
+        cdef uint32_t wid
+        for w_str in item["unit"]["words"]:
+            if self.tmodel.idx.has_word(w_str):
+                wid = self.tmodel.idx.get_id(w_str)
+                with self._dirty_queue_mutex: # Protect inverted_cpp if accessed by worker
+                    self.inverted_cpp[wid].push_back(iid)
+
         self._add_to_heap(iid, grp, key)
 
-    cpdef tuple build_from_input(self, list items):
+    cpdef void build_from_input(self, list items):
         """
-        items: list of {"filename", "index", "unit"}
-        returns (words_map, sent_map) after building.
+        items: list of {"filename", "unit"}
         """
+        # For bulk loading, it's better to pause the worker thread, load, then resume.
+        # This prevents the worker from trying to process incomplete data during build.
+        self._signal_worker_pause()
+        self._wait_for_worker_to_pause() # Wait for worker to truly pause
+
         cdef int i
         cdef Py_ssize_t n = len(items)
         cdef double now_h = datetime.now().timestamp() / 3600.0
         for i in range(n):
-            # always pass promo_data tuple
-            self.add_item(items[i], i, (self.words_map, self.sent_map, i), now_h)
-        return self.words_map, self.sent_map
+            # No need to protect _dirty_items here as worker is paused
+            # Call add_item directly, accessing maps from self
+            self.add_item(items[i], i, now_h)
+        
+        self._signal_worker_resume() # Resume worker after build
 
-    cpdef tuple peek_next(self, float grp):
+    cpdef tuple peek_next(self, int grp):
         """
         Look at the top of the heap for group=grp.
+        No longer directly processes dirty items.
         """
-        if not self.heaps[grp]:
+        # The background thread handles dirty item processing.
+        # Ensure the worker is running and not paused before peeking if it's expected to clear the queue.
+        # If the queue is empty, we might want to wait for the worker to finish.
+        # For peek, we don't necessarily need to wait for the worker to finish.
+        
+        cdef priority_queue[HeapItem, vector[HeapItem], HeapComparator] *heap_ptr
+        if self._heaps_cpp.count(grp) == 0:
             return None, None
-        iid, _ = self.heaps[grp].peekitem()
-        return self.items[iid], iid
+        
+        heap_ptr = &self._heaps_cpp.at(grp)
+        if heap_ptr[0].empty():
+            return None, None
+        
+        cdef HeapItem top_item = heap_ptr[0].top()
+        return self.items[top_item.iid], top_item.iid
 
-    cpdef tuple pop_next(self, float grp):
+    cpdef tuple pop_next(self, int grp):
         """
         Pop the top element from group=grp.
+        No longer directly processes dirty items.
         """
-        if not self.heaps[grp]:
+        # Similar to peek_next, rely on background thread for processing.
+        
+        cdef priority_queue[HeapItem, vector[HeapItem], HeapComparator] *heap_ptr
+        if self._heaps_cpp.count(grp) == 0:
             return None, None
-        iid, _ = self.heaps[grp].popitem()
-        self.i2g.pop(iid, None)
-        return self.items.pop(iid), iid
+        
+        heap_ptr = &self._heaps_cpp.at(grp)
+        if heap_ptr[0].empty():
+            return None, None
+        
+        cdef HeapItem top_item = heap_ptr[0].top()
+        heap_ptr[0].pop()
+        
+        self.i2g.pop(top_item.iid, None)
+        return self.items.pop(top_item.iid), top_item.iid
 
     cpdef void remove_item(self, int iid):
         """
         Remove an item entirely from all queues and indices.
         """
-        # remove from heaps
-        grp = self.i2g.pop(iid, None)
-        if grp is not None:
-            self.heaps[grp].pop(iid, None)
+        # ADAPTED: grp is int
+        grp = self.i2g.pop(iid, -1)
+        if grp != -1:
+            pass
 
-        # remove from inverted index
-        for w in self.items[iid]["unit"]["words"]:
-            self.inverted[w].discard(iid)
+        cdef str w_str
+        cdef uint32_t wid
+        cdef vector[int]* iids_vec_ptr
 
-        # drop it
+        if iid not in self.items:
+            return
+        
+        cdef Py_ssize_t k
+
+        for w_str in self.items[iid]["unit"]["words"]:
+            if self.tmodel.idx.has_word(w_str):
+                wid = self.tmodel.idx.get_id(w_str)
+                with self._dirty_queue_mutex: # Protect inverted_cpp
+                    if self.inverted_cpp.count(wid) > 0:
+                        iids_vec_ptr = &self.inverted_cpp.at(wid)
+                        
+                        for k in range(iids_vec_ptr[0].size()):
+                            if iids_vec_ptr[0][k] == iid:
+                                iids_vec_ptr[0].erase(iids_vec_ptr[0].begin() + k)
+                                break
+                        if iids_vec_ptr[0].empty():
+                            self.inverted_cpp.erase(wid)
+
         self.items.pop(iid, None)
 
     cpdef void process_answer(self, int iid, int feedback_level):
         """
-        Called after the user answers a question.  Updates the master model,
+        Called after the user answers a question. Updates the master model,
         then removes & re-scores any affected dependents.
         """
+        # 1. Signal worker to pause and wait for it to finish current processing
+        self._signal_worker_pause()
+        self._wait_for_worker_to_pause() # Ensure worker is truly paused and not touching shared data
+
+        # 2. Main thread proceeds with its immediate, critical work safely
         item = self.items[iid]
-        # update underlying model
         self.master.update_knowledge(item["unit"]["words"],
                                      self.lang,
                                      feedback_level)
-        # remove answered item
         self.remove_item(iid)
-        cdef double now_h = datetime.now().timestamp() / 3600.0
+        
+        cdef set changed_words_py = set(item["unit"]["words"])
+        cdef set deps_to_add_to_dirty_queue = set()
 
-        # any sentence sharing a word needs re-scoring
-        cdef set changed = set(item["unit"]["words"])
-        cdef set deps = set()
-        for w in changed:
-            # clear old promotion data for word
-            self.words_map.pop(w, None)
-            deps |= self.inverted[w]
+        cdef str w_str
+        cdef uint32_t wid
+        cdef vector[int]* iids_vec_ptr
 
-        for d in deps:
-            if d in self.items:
-                self.sent_map.pop(d, None)
-                self.update_item(d, (self.words_map, self.sent_map, d), now_h)
+        cdef string w_cpp_key
+
+        for w_str in changed_words_py:
+            w_cpp_key = w_str.encode('utf-8')
+            # Protect these maps during modification by the main thread
+            with self._dirty_queue_mutex:
+                self._words_map_v_cpp.erase(w_cpp_key)
+                self._words_map_i_cpp.erase(w_cpp_key)
+            
+            if self.tmodel.idx.has_word(w_str):
+                wid = self.tmodel.idx.get_id(w_str)
+                # No need to protect inverted_cpp here, as worker is paused
+                if self.inverted_cpp.count(wid) > 0:
+                    iids_vec_ptr = &self.inverted_cpp.at(wid)
+                    for d_iid in iids_vec_ptr[0]:
+                        deps_to_add_to_dirty_queue.add(d_iid)
+
+        for d_iid in deps_to_add_to_dirty_queue:
+            if d_iid in self.items:
+                with self._dirty_queue_mutex: # Protect _sent_map_cpp and _dirty_items when adding
+                    self._sent_map_cpp.erase(d_iid)
+                    self._dirty_items.push_back(d_iid)
+        
+        # 3. Signal worker to resume after adding new items
+        self._signal_worker_resume()
+
+    # _process_dirty_items is now internal to the background thread's logic
+    # It is no longer a cpdef method.
+    # cpdef void _process_dirty_items(self, int max_items_to_process, double now_h):
 
     cpdef void update_item(self,
                            int iid,
-                           object promo_data,
                            double now_h):
         """
         Re-score an existing item (after some words changed).
+        This is called by both main thread (e.g., build_from_input) and worker thread.
         """
-        cdef float grp, key
-        grp, key = self._score_and_group(self.items[iid],
-                                         promo_data,
-                                         now_h)
+        cdef int grp
+        cdef float key
+        # Call _score_and_group directly, accessing maps from self
+        grp, key = self._score_and_group(self.items[iid], iid, now_h)
         self._add_to_heap(iid, grp, key)
 
-    cpdef Py_ssize_t size(self, float grp=-1.0):
+    cpdef Py_ssize_t size(self, int grp=-1):
         """
         Total size of all queues, or size of one group.
         """
         cdef Py_ssize_t tot
-        if grp < 0.0:
+        cdef unordered_map[int, priority_queue[HeapItem, vector[HeapItem], HeapComparator]].iterator it
+        if grp == -1:
             tot = 0
-            for h in self.heaps.values():
-                tot += len(h)
+            # Need to protect _heaps_cpp if worker might modify it (unlikely for group keys)
+            # but safer to assume it's shared.
+            with self._dirty_queue_mutex: # Reusing the mutex for general shared data access
+                for it in self._heaps_cpp.begin():
+                    tot += deref(it).second.size()
             return tot
-        return len(self.heaps[grp])
+        elif self._heaps_cpp.count(grp) > 0:
+            with self._dirty_queue_mutex: # Protect specific heap access
+                return self._heaps_cpp.at(grp).size()
+        return 0
 
     cpdef tuple _score_and_group(self,
-                                               object item,
-                                               object promo_data,
-                                               double now_h):
+                                 object item,
+                                 int iid,
+                                 double now_h):
         """
-        Returns (grp,key).  Always calls predict_answer in promotion-data mode.
+        Returns (grp,key). Always calls predict_answer in promotion-data mode.
         """
         cdef list words = item["unit"]["words"]
-        cdef float grp, key
+        cdef int grp
+        cdef float key
         cdef float[::1] effs
-        # always build promotion‐data
-        (grp, effs) = predict_answer(self.tmodel, words, True, promo_data)
 
-        if grp == 0.0:
+        # Pass self's C++ member maps directly to the external C function
+        (grp, effs) = predict_answer_for_queue(self.tmodel, words, True,
+                                              self._words_map_v_cpp, self._words_map_i_cpp, self._sent_map_cpp, iid)
+
+        if grp == 0:
             key = calculate_unknownness(effs)
-        elif grp == 1.0:
-            # fallback to Python model’s predict
+        elif grp == 2:
             key = self.tmodel.predict_understanding(words, now_h)
         else:
-            # partial group, use promotion potential
             key = self._promotion_potential(words, effs, now_h)
 
         return grp, key
 
-    cpdef void _add_to_heap(self, int iid, float grp, float key):
+    cpdef void _add_to_heap(self, int iid, int grp, float key):
         """
-        Maintains a stable heapdict per group.
+        Maintains a stable heap per group using C++ priority_queue.
         """
-        cdef float old = self.i2g.get(iid, -1.0)
-        if old >= 0.0:
-            self.heaps[old].pop(iid, None)
-        # tie‐break by insertion order
-        self.heaps[grp][iid] = (key, next(self.counter))
-        self.i2g[iid] = grp
+        cdef int old_grp = self.i2g.get(iid, -1)
+        
+        # This section needs to be protected if multiple threads add/remove items
+        with self._dirty_queue_mutex: # Protect heap modifications and i2g
+            if old_grp != -1 and old_grp != grp:
+                if self._heaps_cpp.count(old_grp) > 0:
+                    cdef HeapItem dummy_item
+                    dummy_item.key = 1e9 # Very high key to send it to bottom
+                    dummy_item.insertion_order = next(self.counter)
+                    dummy_item.iid = iid
+                    self._heaps_cpp.at(old_grp).push(dummy_item)
+
+            cdef HeapItem new_heap_item
+            new_heap_item.key = key
+            new_heap_item.insertion_order = next(self.counter)
+            new_heap_item.iid = iid
+            
+            if self._heaps_cpp.count(grp) == 0:
+                self._heaps_cpp[grp] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+            
+            self._heaps_cpp.at(grp).push(new_heap_item)
+            self.i2g[iid] = grp
 
     cpdef float _promotion_potential(self, list words, float[::1] eff_prof, double now_h):
         """
         How strongly these words “pull” promotion of partially‐known sentences.
+        ADAPTED to use C++ words_map and sent_map.
         """
         cdef float pot = 0.0
         cdef float s
-        cdef int iid
+        cdef int iid_val
         cdef float pred
         cdef float total
-        for w in words:
-            data = self.words_map.get(w)
-            if not data:
-                continue
-            s = 0.0
-            for iid in data["i"]:
-                s += self.sent_map.get(iid, 0.0)
-            pot += s / max(1, data["v"])
+        cdef str w_str
+        cdef string w_cpp_key
+        
+        cdef unordered_map[string, int].iterator words_map_v_it
+        cdef unordered_map[string, unordered_set[int]].iterator words_map_i_it
+        cdef unordered_map[int, float].iterator sent_map_it
+        cdef unordered_set[int].iterator iid_set_it
+
+        for w_str in words:
+            w_cpp_key = w_str.encode('utf-8')
+            # These lookups are read-only, so no mutex needed here if maps are only written by main thread
+            # or if writes are protected and reads are eventually consistent.
+            # However, since the worker thread also reads/writes to these maps,
+            # they must be protected for *all* access points.
+            with self._dirty_queue_mutex:
+                words_map_v_it = self._words_map_v_cpp.find(w_cpp_key)
+                words_map_i_it = self._words_map_i_cpp.find(w_cpp_key)
+                
+                if words_map_v_it != self._words_map_v_cpp.end() and words_map_i_it != self._words_map_i_cpp.end():
+                    s = 0.0
+                    for iid_set_it in deref(words_map_i_it).second.begin():
+                        sent_map_it = self._sent_map_cpp.find(deref(iid_set_it))
+                        if sent_map_it != self._sent_map_cpp.end():
+                            s += deref(sent_map_it).second
+                    pot += s / max(1, deref(words_map_v_it).second)
 
         if pot == 0.0:
-            # fallback: average above‐threshold activation
             pred = self.tmodel.predict_understanding(words, now_h)
             total = 0.0
             for val in eff_prof:
                 total += (val if val > pred else pred)
-            return total / len(words)
+            return total / max(1, len(words))
 
         return -pot

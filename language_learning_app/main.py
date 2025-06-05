@@ -96,7 +96,7 @@ class LanguageLearningModel:
         mdl = self.get_or_create_model(language)
         ts = datetime.datetime.now().timestamp() / 3600.0
 
-        mdl.update_proficiency(words, (feedback_level - 1) / 2, ts)
+        mdl.update_proficiency(words, feedback_level / 2, ts)
         self.save_model(language)
 
     def reset_vocabulary(self, language=None):
@@ -187,7 +187,7 @@ def scan_input(lang: str):
         _, _, reviewed, _ = load_log_file(lang, stem)
         if idx in reviewed or not unit.get("words"):
             continue
-        items.append({"filename": f"{stem}.json", "index": idx, "unit": unit})
+        items.append({"filename": stem, "index": idx, "unit": unit})
     return items
 
 
@@ -216,8 +216,11 @@ Total vocabulary: {stats['total_words']} words\n
 {proficiency_stats}""")
 
 def _commit_queue(level, current_item, current_iid, lang):
-    stem = Path(current_item["filename"]).stem
+    stem = current_item["filename"]
     idx = current_item["index"]
+    
+    st.session_state.learning_queue_obj.process_answer(current_iid, level)
+    
     revealed, visible, reviewed, target = load_log_file(lang, stem)
     revealed.add(idx)
     reviewed.add(idx)
@@ -225,7 +228,6 @@ def _commit_queue(level, current_item, current_iid, lang):
     target.add(idx)
     save_session_state(lang, stem, revealed, target, visible, reviewed)
 
-    st.session_state.learning_queue_obj.process_answer(current_iid, level)
     st.session_state.queue_source_revealed = False
     st.rerun()
 # -------------------------------------------------------------------
@@ -239,12 +241,10 @@ def queue_view(model, lang):
     if "learning_queue_obj" not in st.session_state or st.session_state.learning_queue_target != lang:
         q = LearningQueue(model, lang)
         all_items = scan_input(lang.lower())
-        wmap, smap = q.build_from_input(all_items)
+        q.build_from_input(all_items)
         st.session_state.update({
             "learning_queue_obj": q,
             "learning_queue_target": lang,
-            "words_mapping": wmap,
-            "sentences_mapping": smap,
         })
 
     queue: LearningQueue = st.session_state.learning_queue_obj
@@ -256,10 +256,14 @@ def queue_view(model, lang):
             st.session_state.pop("learning_queue_obj", None)
             st.rerun()
         return
+    
+    q0_size = queue.size(0)
+    q1_size = queue.size(1)
+    q2_size = queue.size(2)
 
-    st.info(f'Queue contains {total} items. \n\n"Didn\'t understand" ({queue.size(0)}), "Partially understood" ({queue.size(0.5)}), "Fully understood" ({queue.size(1)}).')
+    st.info(f'Queue contains {total} items. \n\n"Didn\'t understand" ({q0_size}), "Partially understood" ({q1_size}), "Fully understood" ({q2_size}).')
 
-    group = 1 if queue.size(1) else (0.5 if queue.size(0.5) else 0)
+    group = 2 if q2_size else (1 if q1_size else 0)
     current_item, current_iid = queue.peek_next(group)
     if current_item is None:
         st.warning("No valid item found.")
@@ -279,13 +283,13 @@ def queue_view(model, lang):
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("❌😔❌", use_container_width=True):
-                _commit_queue(1, current_item, current_iid, lang)
+                _commit_queue(0, current_item, current_iid, lang)
         with c2:
             if st.button("🔶🤔🔶", use_container_width=True):
-                _commit_queue(2, current_item, current_iid, lang)
+                _commit_queue(1, current_item, current_iid, lang)
         with c3:
             if st.button("✅🧐✅", use_container_width=True):
-                _commit_queue(3, current_item, current_iid, lang)
+                _commit_queue(2, current_item, current_iid, lang)
 
 # -------------------------------------------------------------------
 #  NUMERICAL FILE-NAV HELPERS 
@@ -377,7 +381,7 @@ def main():
     # build an index of the NDJSON
     input_nd = Path("input") / f"{target_language}.ndjson"
     if not input_nd.exists():
-        st.error(f"No {target_language}.ndjson. Run migrate_data.py")
+        st.error(f"No {target_language}.ndjson.")
         return
 
     # build per‐file index
@@ -439,8 +443,6 @@ def main():
                 "current_file",
                 "current_num_index",
                 "force_state_reset",
-                "words_mapping",
-                "sentences_mapping",
             ]:
                 del st.session_state[k]
         st.session_state.update({
@@ -524,6 +526,16 @@ def main():
     if st.sidebar.button("Add files"):
         prepare(target_language.lower())
         st.rerun()
+        
+    def save_current_session_state():
+        save_session_state(
+                target_language,
+                selected_stem,
+                st.session_state.revealed,
+                st.session_state.to_replace_indices,
+                st.session_state.visible,
+                st.session_state.reviewed,
+            )
 
     # --- update target sentences button ---
     col1, col2 = st.columns(2)
@@ -536,14 +548,7 @@ def main():
             )
             st.session_state.to_replace_indices.update(naturals)
             st.session_state.potential_natural_recount = True
-            save_session_state(
-                target_language,
-                selected_stem,
-                st.session_state.revealed,
-                st.session_state.to_replace_indices,
-                st.session_state.visible,
-                st.session_state.reviewed,
-            )
+            
             st.success(f"Added {len(naturals)} natural target sentences!")
             st.rerun()
 
@@ -597,14 +602,7 @@ def main():
                 if st.button(f"{prefix}{unit['target']}", key=f"sent_{i}"):
                     st.session_state.revealed.add(i)
                     st.session_state.visible[i] = True
-                    save_session_state(
-                        target_language,
-                        selected_stem,
-                        st.session_state.revealed,
-                        st.session_state.to_replace_indices,
-                        st.session_state.visible,
-                        st.session_state.reviewed,
-                    )
+                    save_current_session_state()
                     st.session_state[f"feedback_{i}"] = True
                     st.rerun()
             else:
@@ -613,26 +611,12 @@ def main():
                     st.info(unit["source"])
                     if st.button("Hide source", key=f"hide_{i}"):
                         st.session_state.visible[i] = False
-                        save_session_state(
-                            target_language,
-                            selected_stem,
-                            st.session_state.revealed,
-                            st.session_state.to_replace_indices,
-                            st.session_state.visible,
-                            st.session_state.reviewed,
-                        )
+                        save_current_session_state()
                         st.rerun()
                 else:
                     if st.button(f"{prefix}{unit['target']}", key=f"show_{i}"):
                         st.session_state.visible[i] = True
-                        save_session_state(
-                            target_language,
-                            selected_stem,
-                            st.session_state.revealed,
-                            st.session_state.to_replace_indices,
-                            st.session_state.visible,
-                            st.session_state.reviewed,
-                        )
+                        save_current_session_state()
                         st.rerun()
 
                 fb_key = f"feedback_{i}"
@@ -641,27 +625,20 @@ def main():
                         model.update_knowledge(unit["words"], target_language, level)
                         st.session_state[fb_key] = False
                         st.session_state.reviewed.add(i)
-                        save_session_state(
-                            target_language,
-                            selected_stem,
-                            st.session_state.revealed,
-                            st.session_state.to_replace_indices,
-                            st.session_state.visible,
-                            st.session_state.reviewed,
-                        )
+                        save_current_session_state()
                         st.session_state.potential_natural_recount = True
                         st.rerun()
 
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         if st.button("❌😔❌", key=f"fb1_{i}", use_container_width=True):
-                            _commit(1)
+                            _commit(0)
                     with c2:
                         if st.button("🔶🤔🔶", key=f"fb2_{i}", use_container_width=True):
-                            _commit(2)
+                            _commit(1)
                     with c3:
                         if st.button("✅🧐✅", key=f"fb3_{i}", use_container_width=True):
-                            _commit(3)
+                            _commit(2)
                     st.divider()
                     
         else:
@@ -684,14 +661,7 @@ def main():
                 st.session_state.reviewed.add(i)
                 st.session_state.visible[i] = False
                 mark += 1
-        save_session_state(
-            target_language,
-            selected_stem,
-            st.session_state.revealed,
-            st.session_state.to_replace_indices,
-            st.session_state.visible,
-            st.session_state.reviewed,
-        )
+        save_current_session_state()
         st.success(f"Marked {mark} sentences as understood!")
         st.rerun()
 

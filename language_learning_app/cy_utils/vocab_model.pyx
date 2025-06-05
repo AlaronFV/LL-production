@@ -12,15 +12,20 @@ from libcpp.vector cimport vector
 from libc.string cimport memcpy
 from libcpp.algorithm cimport sort
 from cpython.bytes cimport PyBytes_FromStringAndSize
+from libcpp.unordered_map cimport unordered_map # NEW
+from libcpp.string cimport string # NEW
+from libcpp.queue cimport priority_queue # NEW
+from libcpp.functional cimport greater # NEW
+from libcpp.utility cimport pair # NEW: For std::pair
 
 import numpy as np
 cimport numpy as cnp
 
-from collections import deque, defaultdict
+from collections import deque # Keep for BFS in _propagate
 from datetime import datetime
 
 # Import the declarations from your .pxd file
-from cy_utils.vocab_model cimport _WordIndex, VocabularyModel, promotion_times
+from cy_utils.vocab_model cimport _WordIndex, VocabularyModel, promotion_times, DecayItem
 
 # Helper to find intersection size of two sorted vectors (like sets)
 cdef inline Py_ssize_t _intersection_size_vec_vec(vector[uint32_t] &vec1, vector[uint32_t] &vec2):
@@ -73,41 +78,40 @@ cpdef int promotion_times(float b, float v):
         t += 1
 
 # ---------------------------------------------------------------------------
-#   WordIndex: bidirectional str <-> uint32 (UNCHANGED, except for size property)
+#   WordIndex: bidirectional str <-> uint32 (ADAPTED for C++ internals)
 # ---------------------------------------------------------------------------
 cdef class _WordIndex:
 
     def __cinit__(self):
-        self._w2i = {}
-        self._i2w = []
+        # Initialize C++ maps directly
+        self._w2i_cpp = unordered_map[string, uint32_t]()
+        self._i2w_cpp = vector[string]()
 
     cpdef uint32_t get_id(self, str w):
+        cdef string w_cpp = w.encode('utf-8') # Convert Python str to C++ string
         cdef uint32_t idx
-        if w in self._w2i:
-            return <uint32_t>self._w2i[w]
-        idx = <uint32_t>len(self._i2w)
-        self._w2i[w] = idx
-        self._i2w.append(w)
+        
+        if self._w2i_cpp.count(w_cpp): # Use C++ map's count method
+            return self._w2i_cpp[w_cpp]
+        
+        idx = <uint32_t>self._i2w_cpp.size() # Use C++ vector's size
+        self._w2i_cpp[w_cpp] = idx
+        self._i2w_cpp.push_back(w_cpp)
         return idx
 
     cpdef bint has_word(self, str w):
-        return w in self._w2i
+        cdef string w_cpp = w.encode('utf-8')
+        return self._w2i_cpp.count(w_cpp) > 0
 
     cpdef str get_word(self, uint32_t idx):
-        return <str>self._i2w[idx]
+        # Basic bounds check
+        if idx >= self._i2w_cpp.size():
+            raise IndexError("Word ID out of bounds")
+        return self._i2w_cpp[idx].decode('utf-8') # Convert C++ string to Python str
 
-    @property
-    def size(self):
-        return len(self._i2w)
+    cpdef Py_ssize_t size(self):
+        return self._i2w_cpp.size()
 
-    @property
-    def id2word(self):
-        return self._i2w
-
-
-# ---------------------------------------------------------------------------
-#   MemoryTrace: REMOVED COMPLETELY
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 #   VocabularyModel: per-word arrays + traces + activation & decay
@@ -121,7 +125,7 @@ cdef class VocabularyModel:
                   float base_decay_rate        = 0.05,
                   float proficiency_min        = 0.01,
                   float proficiency_max        = 0.99,
-                  double min_elapsed_h         = 1.0, # NEW: Default to 1 hour
+                  double min_elapsed_h         = 1.0,
                   float propagation_threshold = 0.01,
                   float trace_delete_threshold= 0.001):
         self.idx                   = _WordIndex()
@@ -131,7 +135,7 @@ cdef class VocabularyModel:
         self.base_decay_rate       = base_decay_rate
         self.proficiency_min       = proficiency_min
         self.proficiency_max       = proficiency_max
-        self.min_elapsed_h         = min_elapsed_h # NEW: Initialize
+        self.min_elapsed_h         = min_elapsed_h
         self.propagation_threshold = propagation_threshold
         self.trace_delete_threshold= trace_delete_threshold
 
@@ -139,19 +143,25 @@ cdef class VocabularyModel:
         self.vol            = None
         self.eff_prof       = None
         self.encounters     = None
-        self.last_decayed   = None
-        self._resize_arrays(0)
+        self._resize_arrays(0) # Will initialize prof, vol, eff_prof, encounters and _word_last_decay_h
 
         # C++ vectors are default-constructed as empty
-        self.word_to_traces = {}
+        self._trace_word_ids = vector[vector[uint32_t]]()
+        self._trace_timestamps_h = vector[double]()
+        self._trace_activations = vector[float]()
+        self._trace_decay_factors = vector[float]()
 
-        # Initialize appointment times to a very old timestamp to ensure first run triggers full decay
-        self._next_word_decay_appointment_h = -1.0
-        self._next_trace_decay_appointment_h = -1.0
+        # word_to_traces is now a C++ unordered_map
+        self.word_to_traces = unordered_map[uint32_t, vector[int]]()
+
+        # NEW: Initialize priority queues for decay scheduling
+        # They are default-constructed as empty
+        self._word_decay_pq = priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]]()
+        self._trace_decay_pq = priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]]()
 
 
     # -----------------------------------------------------------------------
-    #   grow arrays to size ≥ new_n (UNCHANGED)
+    #   grow arrays to size ≥ new_n (ADAPTED for _word_last_decay_h and PQ init)
     # -----------------------------------------------------------------------
     cdef void _resize_arrays(self, Py_ssize_t new_n):
         cdef Py_ssize_t cur
@@ -163,6 +173,7 @@ cdef class VocabularyModel:
             if new_n <= cur:
                 return
 
+        cdef Py_ssize_t old_size = cur
         cdef Py_ssize_t size = 1 if cur == 0 else cur
         while size < new_n:
             size <<= 1
@@ -180,16 +191,44 @@ cdef class VocabularyModel:
         self.vol           = _grow(self.vol,          np.float32,   0.9)
         self.eff_prof      = _grow(self.eff_prof,     np.float32,   0.0)
         self.encounters    = _grow(self.encounters,   np.uint32,    0)
-        self.last_decayed  = _grow(self.last_decayed, np.float64, 0.0)
+
+        # NEW: Resize C++ vector for last_decayed and populate PQ
+        # If current size is 0, initialize to size, otherwise grow
+        if old_size == 0:
+            self._word_last_decay_h.resize(size, 0.0)
+            # Populate PQ for all new words
+            cdef uint32_t i
+            cdef DecayItem item
+            for i in range(size):
+                item.id_or_idx = i
+                item.next_decay_time = 0.0 # Initial decay time (effectively now)
+                self._word_decay_pq.push(item)
+        else:
+            # Create a temporary vector with new size and copy old data
+            cdef vector[double] temp_last_decayed
+            temp_last_decayed.resize(size)
+            for i in range(old_size):
+                temp_last_decayed[i] = self._word_last_decay_h[i]
+            for i in range(old_size, size):
+                temp_last_decayed[i] = 0.0 # Fill new elements
+                # Add new words to the priority queue
+                cdef DecayItem item
+                item.id_or_idx = i
+                item.next_decay_time = 0.0 # Initial decay time (effectively now)
+                self._word_decay_pq.push(item)
+            self._word_last_decay_h = temp_last_decayed
+
 
     # -----------------------------------------------------------------------
-    #   ensure any new words are indexed & arrays grown (UNCHANGED)
+    #   ensure any new words are indexed & arrays grown
+    #   (ADAPTED to use _WordIndex.size() and _WordIndex.get_id)
     # -----------------------------------------------------------------------
     cdef set _ensure_words(self, list words):
         cdef set ids = set()
+        cdef str w
         for w in words:
-            ids.add(self.idx.get_id(w))
-        self._resize_arrays(self.idx.size)
+            ids.add(self.idx.get_id(w)) # This will add word to _WordIndex and grow arrays if needed
+        self._resize_arrays(self.idx.size()) # Ensure arrays match current _WordIndex size
         return ids
 
     cdef float _eff_prof_formula(self, float p, float v) nogil:
@@ -200,16 +239,17 @@ cdef class VocabularyModel:
         cdef float[::1] out = np.zeros(n, dtype=np.float32)
         cdef Py_ssize_t i
         cdef str w
+        cdef uint32_t wid
         for i, w in enumerate(words):
-            # ADAPTED: Check for word existence without adding it
             if self.idx.has_word(w):
-                out[i] = self.eff_prof[self.idx._w2i[w]]
+                wid = self.idx.get_id(w) # Get ID using the optimized _WordIndex
+                out[i] = self.eff_prof[wid]
             else:
                 out[i] = 0.0365 # Default value for unknown words
         return out
 
     # -----------------------------------------------------------------------
-    #   Trace management with C++ vectors
+    #   Trace management with C++ vectors and unordered_map
     # -----------------------------------------------------------------------
     cpdef int add_trace_cpp(self, set word_ids_py, double timestamp_h, float activation, float decay_factor):
         cdef vector[uint32_t] current_word_ids_cpp
@@ -227,10 +267,19 @@ cdef class VocabularyModel:
         self._trace_activations.push_back(activation)
         self._trace_decay_factors.push_back(decay_factor)
 
-        # Update reverse index (word_to_traces) with trace index
+        # Update reverse index (word_to_traces) with trace index - NOW C++ UNORDERED_MAP
+        cdef vector[int]* trace_list_ptr # Pointer to the vector in the map
         for wid in word_ids_py:
-            self.word_to_traces.setdefault(wid, []).append(trace_idx)
+            # Access or create the vector for this word_id and append the trace_idx
+            trace_list_ptr = &self.word_to_traces[wid] # This creates if not exists, or gets reference
+            trace_list_ptr.push_back(trace_idx)
         
+        # NEW: Add trace to the trace decay priority queue
+        cdef DecayItem trace_item
+        trace_item.id_or_idx = trace_idx
+        trace_item.next_decay_time = timestamp_h + self.min_elapsed_h # Schedule next decay check
+        self._trace_decay_pq.push(trace_item)
+
         return trace_idx # Return the index of the newly added trace
 
     cpdef float decay_trace_activation_cpp(self, int trace_idx, double now_h):
@@ -240,13 +289,13 @@ cdef class VocabularyModel:
         cdef double current_timestamp_h
 
         if trace_idx < 0 or trace_idx >= self._trace_activations.size():
-            raise IndexError("Trace index out of bounds in decay_trace_activation_cpp")
+            # This should ideally not happen if called correctly from PQ, but for safety
+            return 0.0
 
         current_activation = self._trace_activations[trace_idx]
         current_decay_factor = self._trace_decay_factors[trace_idx]
         current_timestamp_h = self._trace_timestamps_h[trace_idx]
 
-        # ADAPTED: Check against min_elapsed_h
         elapsed = now_h - current_timestamp_h
         if elapsed <= self.min_elapsed_h:
             return current_activation
@@ -267,9 +316,16 @@ cdef class VocabularyModel:
         cdef int cnt = 0
         cdef int trace_idx # Now iterating over indices
         cdef float tA
+        cdef vector[int]* trace_indices_ptr # Pointer to the vector of trace indices
 
+        # Check if word_id exists in the unordered_map
+        if self.word_to_traces.count(word_id) == 0:
+            return 0.0 # No traces for this word
+
+        trace_indices_ptr = &self.word_to_traces.at(word_id) # Use .at() for bounds checking
+        
         # Iterate through trace indices associated with this word_id
-        for trace_idx in self.word_to_traces.get(word_id, []):
+        for trace_idx in trace_indices_ptr[0]: # Dereference pointer to iterate
             tA = self.decay_trace_activation_cpp(trace_idx, now_h) # Call new decay function
             if tA > self.activation_threshold:
                 A   += tA
@@ -280,8 +336,8 @@ cdef class VocabularyModel:
 
 
     cdef void apply_decay_to_word_id(self, uint32_t wid, double now_h):
-        cdef double elapsed = now_h - self.last_decayed[wid]
-        # ADAPTED: Check against min_elapsed_h
+        # Use _word_last_decay_h instead of last_decayed NumPy array
+        cdef double elapsed = now_h - self._word_last_decay_h[wid]
         if elapsed <= self.min_elapsed_h:
             return
         cdef float p = self.prof[wid]
@@ -300,53 +356,65 @@ cdef class VocabularyModel:
         self.prof[wid]        = p
         self.vol[wid]         = v
         self.eff_prof[wid]    = self._eff_prof_formula(p, v)
-        self.last_decayed[wid]= now_h
+        self._word_last_decay_h[wid]= now_h # Update C++ vector timestamp
 
-    cpdef void apply_decay_to_all_words(self, double now_h):
-        # ADAPTED: Always perform full scan, then update appointment time
+    cpdef void _process_due_word_decays(self, double now_h):
+        """
+        NEW: Processes words from the priority queue whose decay time is due.
+        """
+        cdef DecayItem current_item
         cdef uint32_t wid
-        cdef double min_last_decayed_h = now_h # Initialize with current time, or a very large value
 
-        for wid in range(self.idx.size):
-            self.apply_decay_to_word_id(wid, now_h)
-            # Find the minimum last_decayed among all words *after* decay
-            # Only consider words that were actually decayed in this run (elapsed > min_elapsed_h)
-            # or if the timestamp was already very recent.
-            if self.last_decayed[wid] < min_last_decayed_h:
-                min_last_decayed_h = self.last_decayed[wid]
-        
-        # Calculate the next word decay appointment: min_last_decayed_h + self.min_elapsed_h
-        self._next_word_decay_appointment_h = min_last_decayed_h + self.min_elapsed_h
+        while not self._word_decay_pq.empty():
+            current_item = self._word_decay_pq.top()
+            if current_item.next_decay_time > now_h:
+                break # No more items are due yet
+            
+            self._word_decay_pq.pop() # Remove from PQ
 
-    # NEW: Apply decay to all traces
-    cdef void apply_decay_to_all_traces(self, double now_h):
-        # ADAPTED: Always perform full scan, then update appointment time
+            wid = current_item.id_or_idx
+            # Ensure word ID is still valid (e.g., if vocabulary size shrunk, though unlikely)
+            if wid < self.idx.size():
+                self.apply_decay_to_word_id(wid, now_h)
+                # Re-schedule the word for its next decay
+                current_item.next_decay_time = now_h + self.min_elapsed_h # Schedule next check for min_elapsed_h later
+                self._word_decay_pq.push(current_item)
+            # else: word no longer exists, just discard from PQ
+
+    cpdef void _process_due_trace_decays(self, double now_h):
+        """
+        NEW: Processes traces from the priority queue whose decay time is due.
+        """
+        cdef DecayItem current_item
         cdef int trace_idx
-        cdef double min_trace_timestamp_h = now_h # Initialize with current time, or a very large value
-        cdef int num_traces = self._trace_timestamps_h.size()
 
-        for trace_idx in range(num_traces):
-            self.decay_trace_activation_cpp(trace_idx, now_h)
-            # Find the minimum timestamp among all traces *after* decay
-            # Only consider traces that were actually decayed in this run (elapsed > min_elapsed_h)
-            # or if the timestamp was already very recent.
-            if self._trace_timestamps_h[trace_idx] < min_trace_timestamp_h:
-                min_trace_timestamp_h = self._trace_timestamps_h[trace_idx]
-        
-        # Calculate the next trace decay appointment: min_trace_timestamp_h + self.min_elapsed_h
-        self._next_trace_decay_appointment_h = min_trace_timestamp_h + self.min_elapsed_h
+        while not self._trace_decay_pq.empty():
+            current_item = self._trace_decay_pq.top()
+            if current_item.next_decay_time > now_h:
+                break # No more items are due yet
+            
+            self._trace_decay_pq.pop() # Remove from PQ
+
+            trace_idx = current_item.id_or_idx
+            # Ensure trace index is still valid (e.g., if trace was pruned)
+            if trace_idx < self._trace_activations.size() and self._trace_activations[trace_idx] >= self.trace_delete_threshold:
+                self.decay_trace_activation_cpp(trace_idx, now_h)
+                # Re-schedule the trace for its next decay
+                current_item.next_decay_time = now_h + self.min_elapsed_h # Schedule next check for min_elapsed_h later
+                self._trace_decay_pq.push(current_item)
+            # else: trace no longer exists or was pruned, just discard from PQ
 
 
     # -----------------------------------------------------------------------
-    #   2) Full sentence-trace propagation (ADAPTED)
+    #   2) Full sentence-trace propagation (ADAPTED for C++ unordered_map)
     # -----------------------------------------------------------------------
     cdef void _propagate(self, int source_trace_idx):
         queue = deque() # Stores (trace_idx, delta_activation)
         # Basic bounds check for safety
         if source_trace_idx < 0 or source_trace_idx >= self._trace_activations.size():
-            return # Or raise an appropriate error
+            return
 
-        queue.append((source_trace_idx, self._trace_activations[source_trace_idx])) # Use activation from C++ vector
+        queue.append((source_trace_idx, self._trace_activations[source_trace_idx]))
 
         cdef float delta
         cdef int current_trace_idx, neighbor_trace_idx
@@ -354,51 +422,42 @@ cdef class VocabularyModel:
         cdef float step
         cdef float tj_part
 
-        # Declare pointers here (outside the loop), without immediate initialization.
-        # They will point to the vector objects inside _trace_word_ids.
-        cdef vector[uint32_t] current_word_ids_ptr
-        cdef vector[uint32_t] neighbor_word_ids_ptr
+        cdef vector[uint32_t]* current_word_ids_ptr
+        cdef vector[uint32_t]* neighbor_word_ids_ptr
+        cdef vector[int]* trace_indices_for_word_ptr
 
-        cdef set current_trace_neighbors
+        # Use a C++ unordered_set for `current_trace_neighbors` for efficiency
+        cdef unordered_map[int, bint] visited_neighbors # Use map as a set to track visited neighbors for current propagation cycle
 
         cdef uint32_t word_id_in_current_trace
 
-        while queue:
-            current_trace_idx, delta = queue.popleft() # This line should be fine now
+        while not queue.empty(): # Use C++ deque empty()
+            current_trace_idx, delta = queue.front() # Use C++ deque front()
+            queue.pop_front() # Use C++ deque pop_front()
 
-            # This set will collect *unique* neighbor trace indices
-            current_trace_neighbors = set() # This is a Python set, which is fine
+            # Clear visited_neighbors for each new trace in the BFS
+            visited_neighbors.clear()
 
-            # Assign the pointer to the address of the vector at the current index.
-            # This is where the problematic line was.
-            current_word_ids_ptr = self._trace_word_ids[current_trace_idx]
+            current_word_ids_ptr = &self._trace_word_ids[current_trace_idx]
 
-            # Find neighbors through shared words
-            
-            # Iterate over the dereferenced vector using the pointer
-            for word_id_in_current_trace in current_word_ids_ptr:
-                # word_to_traces.get returns a Python list, so this part is Python-level iteration
-                for neighbor_trace_idx in self.word_to_traces.get(word_id_in_current_trace, []):
-                    if neighbor_trace_idx != current_trace_idx: # Exclude self
-                        current_trace_neighbors.add(neighbor_trace_idx)
+            for word_id_in_current_trace in current_word_ids_ptr[0]:
+                if self.word_to_traces.count(word_id_in_current_trace) > 0:
+                    trace_indices_for_word_ptr = &self.word_to_traces.at(word_id_in_current_trace)
+                    for neighbor_trace_idx in trace_indices_for_word_ptr[0]:
+                        if neighbor_trace_idx != current_trace_idx and visited_neighbors.count(neighbor_trace_idx) == 0:
+                            visited_neighbors[neighbor_trace_idx] = True # Mark as visited for this BFS step
 
-            # Process each unique neighbor
-            for neighbor_trace_idx in current_trace_neighbors:
-                # Assign the neighbor pointer similarly
-                neighbor_word_ids_ptr = self._trace_word_ids[neighbor_trace_idx]
+            for neighbor_trace_idx in visited_neighbors: # Iterate over C++ map keys
+                neighbor_word_ids_ptr = &self._trace_word_ids[neighbor_trace_idx]
 
-                # Calculate overlap between current trace and neighbor trace word_ids
-                # Pass dereferenced pointers to _intersection_size_vec_vec
-                ov = _intersection_size_vec_vec(current_word_ids_ptr, neighbor_word_ids_ptr)
+                ov = _intersection_size_vec_vec(current_word_ids_ptr[0], neighbor_word_ids_ptr[0])
 
                 if ov == 0:
                     continue
 
-                # Access size using the dereferenced pointer
-                step = delta / current_word_ids_ptr.size() * ov
+                step = delta / current_word_ids_ptr[0].size() * ov
 
-                # Access size using the dereferenced pointer
-                tj_part = self._trace_activations[neighbor_trace_idx] / neighbor_word_ids_ptr.size() * ov
+                tj_part = self._trace_activations[neighbor_trace_idx] / neighbor_word_ids_ptr[0].size() * ov
 
                 if tj_part < step:
                     self._trace_activations[neighbor_trace_idx] += step - tj_part
@@ -406,9 +465,13 @@ cdef class VocabularyModel:
                         self._trace_activations[neighbor_trace_idx] = 1.0
 
                     if self.propagation_threshold < step:
-                        queue.append((neighbor_trace_idx, step))
+                        queue.push_back((neighbor_trace_idx, step)) # Use C++ deque push_back()
 
     cdef void _prune_traces(self):
+        """
+        ADAPTED for incremental pruning concept (marking and rebuilding).
+        This version still rebuilds, but the next step would be true mark-and-sweep.
+        """
         cdef vector[vector[uint32_t]] new_trace_word_ids
         cdef vector[double] new_trace_timestamps_h
         cdef vector[float] new_trace_activations
@@ -418,58 +481,65 @@ cdef class VocabularyModel:
         cdef uint32_t wid
         cdef int trace_count = self._trace_timestamps_h.size()
 
-        # First pass: identify traces to keep and populate new C++ vectors
+        cdef vector[int] traces_to_keep_indices
         for old_trace_idx in range(trace_count):
             if self._trace_activations[old_trace_idx] >= self.trace_delete_threshold:
-                new_trace_word_ids.push_back(self._trace_word_ids[old_trace_idx])
-                new_trace_timestamps_h.push_back(self._trace_timestamps_h[old_trace_idx])
-                new_trace_activations.push_back(self._trace_activations[old_trace_idx])
-                new_trace_decay_factors.push_back(self._trace_decay_factors[old_trace_idx])
+                traces_to_keep_indices.push_back(old_trace_idx)
+        
+        cdef Py_ssize_t num_kept_traces = traces_to_keep_indices.size()
+        new_trace_word_ids.resize(num_kept_traces)
+        new_trace_timestamps_h.resize(num_kept_traces)
+        new_trace_activations.resize(num_kept_traces)
+        new_trace_decay_factors.resize(num_kept_traces)
 
-        # Replace old C++ vectors with new ones
+        cdef Py_ssize_t new_idx = 0
+        for old_idx in traces_to_keep_indices:
+            new_trace_word_ids[new_idx] = self._trace_word_ids[old_idx]
+            new_trace_timestamps_h[new_idx] = self._trace_timestamps_h[old_idx]
+            new_trace_activations[new_idx] = self._trace_activations[old_idx]
+            new_trace_decay_factors[new_idx] = self._trace_decay_factors[old_idx]
+            new_idx += 1
+
         self._trace_word_ids = new_trace_word_ids
         self._trace_timestamps_h = new_trace_timestamps_h
         self._trace_activations = new_trace_activations
         self._trace_decay_factors = new_trace_decay_factors
 
-        # Rebuild word_to_traces (this part will be Python-heavy, but necessary)
-        self.word_to_traces.clear() # Clear the old dictionary
-        cdef uint32_t current_new_idx
-        cdef vector[uint32_t] word_ids_for_rebuild
-        
-        for current_new_idx in range(self._trace_timestamps_h.size()):
-            word_ids_for_rebuild = self._trace_word_ids[current_new_idx]
-            for wid in word_ids_for_rebuild:
-                self.word_to_traces.setdefault(wid, []).append(current_new_idx)
+        self.word_to_traces.clear()
+        cdef vector[uint32_t]* word_ids_for_rebuild_ptr
+
+        for new_idx in range(num_kept_traces):
+            word_ids_for_rebuild_ptr = &self._trace_word_ids[new_idx]
+            for wid in word_ids_for_rebuild_ptr[0]:
+                self.word_to_traces[wid].push_back(new_idx)
 
 
     # -----------------------------------------------------------------------
-    #   3) Context Support (ADAPTED)
+    #   3) Context Support (ADAPTED for C++ unordered_map)
     # -----------------------------------------------------------------------
     cpdef float calculate_context_support(self, object id_words, Py_ssize_t n):
-        if not id_words or self._trace_timestamps_h.empty(): # Check C++ vector size
+        if not id_words or self._trace_timestamps_h.empty():
             return 0.0
         cdef float mx = 0.0
         cdef int trace_idx
         cdef Py_ssize_t ov
         cdef float r
-        cdef vector[uint32_t] trace_word_ids_vec # To hold a reference to the C++ vector
+        cdef vector[uint32_t]* trace_word_ids_vec_ptr
 
         cdef int num_traces = self._trace_timestamps_h.size()
         for trace_idx in range(num_traces):
-            trace_word_ids_vec = self._trace_word_ids[trace_idx]
-            ov = _intersection_size_set_vec(id_words, trace_word_ids_vec) # Use helper
+            trace_word_ids_vec_ptr = &self._trace_word_ids[trace_idx]
+            ov = _intersection_size_set_vec(id_words, trace_word_ids_vec_ptr[0])
             
             if ov > 0:
-                # Direct access to activation and word_ids size
-                r = (ov / fmax(n, trace_word_ids_vec.size())) * self._trace_activations[trace_idx]
+                r = (ov / fmax(n, trace_word_ids_vec_ptr[0].size())) * self._trace_activations[trace_idx]
                 if r > mx:
                     mx = r
         return mx * 0.5
 
 
     # -----------------------------------------------------------------------
-    #   4) Predict Understanding (ADAPTED for robust word check and optimized decay)
+    #   4) Predict Understanding (ADAPTED for new decay scheduling)
     # -----------------------------------------------------------------------
     cpdef float predict_understanding(self, object words, double current_time_h=-1):
         if not words:
@@ -477,13 +547,11 @@ cdef class VocabularyModel:
         if current_time_h < 0:
             current_time_h = datetime.now().timestamp() / 3600.0
         
-        # ADAPTED: Conditionally apply decay to all words
-        if current_time_h >= self._next_word_decay_appointment_h:
-            self.apply_decay_to_all_words(current_time_h)
+        # NEW: Process due word decays using the priority queue
+        self._process_due_word_decays(current_time_h)
         
-        # ADAPTED: Conditionally apply decay to all traces
-        if current_time_h >= self._next_trace_decay_appointment_h:
-            self.apply_decay_to_all_traces(current_time_h)
+        # NEW: Process due trace decays using the priority queue
+        self._process_due_trace_decays(current_time_h)
 
         cdef float sum_p = 0.0, min_p = 1.0
         cdef set non_zero = set()
@@ -491,22 +559,20 @@ cdef class VocabularyModel:
         cdef uint32_t wid
         cdef float ep
         for w in words:
-            # ADAPTED: Check for word existence without adding it
             if self.idx.has_word(w):
-                wid = self.idx._w2i[w] # Get ID only if it exists
-                # Ensure wid is within the bounds of the NumPy arrays
-                if wid < self.idx.size: # Check against actual vocabulary size
+                wid = self.idx.get_id(w)
+                if wid < self.idx.size():
                     ep = self.eff_prof[wid]
                     non_zero.add(wid)
                 else:
-                    ep = 0.0365 # Should not happen if has_word is true and idx.size is correct
+                    ep = 0.0365
             else:
-                ep = 0.0365 # Default value for unknown words
+                ep = 0.0365
             
             if ep < min_p:
                 min_p = ep
             sum_p += ep
-
+        
         cdef Py_ssize_t n = len(words)
         cdef float avg_p = sum_p / n
         cdef float ctx   = self.calculate_context_support(non_zero, n)
@@ -548,7 +614,6 @@ cdef class VocabularyModel:
         cdef float pmn = self.proficiency_min
         cdef float pmx = self.proficiency_max
 
-        # ADAPTED: Removed the 'updates' dictionary creation
         cdef float cp
         cdef float cv
         cdef float act
@@ -563,7 +628,7 @@ cdef class VocabularyModel:
 
         for wid in wids_py: # Iterate over Python set of word IDs
             self.encounters[wid]   += 1
-            self.last_decayed[wid]  = now_h
+            self._word_last_decay_h[wid]  = now_h # Update C++ vector timestamp
             cp = self.prof[wid]
             cv = self.vol[wid]
             act= self.get_word_activation(wid, now_h) # This call now uses C++ trace data
@@ -590,23 +655,20 @@ cdef class VocabularyModel:
 
 
     # -----------------------------------------------------------------------
-    #   6) Fast binary save/load (ADAPTED FOR C++ VECTORS AND NEW TIMESTAMPS)
+    #   6) Fast binary save/load (ADAPTED FOR C++ VECTORS AND UNORDERED_MAP AND PQs)
     # -----------------------------------------------------------------------
     def save_fast(self, str path):
-        cdef uint32_t n_words  = self.idx.size
-        cdef uint32_t n_traces = self._trace_timestamps_h.size() # Number of traces from C++ vector size
+        cdef uint32_t n_words  = self.idx.size() # Use idx.size()
+        cdef uint32_t n_traces = self._trace_timestamps_h.size()
         cdef bytes b
         cdef uint32_t i
-        cdef vector[uint32_t] current_trace_word_ids_cpp
+        cdef vector[uint32_t]* current_trace_word_ids_cpp_ptr
 
         with open(path, "wb") as f:
-            # 1) header: n_words, n_traces, _next_word_decay_appointment_h, _next_trace_decay_appointment_h
-            # Two uint32_t and two double values (2*4 + 2*8 = 24 bytes)
-            f.write(struct.pack("<IIdd",
-                                n_words,
-                                n_traces,
-                                self._next_word_decay_appointment_h,
-                                self._next_trace_decay_appointment_h))
+            # 1) header: n_words, n_traces
+            # No longer saving _next_word_decay_appointment_h, _next_trace_decay_appointment_h directly
+            # as they are managed by the PQs.
+            f.write(struct.pack("<II", n_words, n_traces))
 
             # 2) pack your 8 floats as little‐endian doubles (UNCHANGED)
             f.write(struct.pack(
@@ -621,100 +683,137 @@ cdef class VocabularyModel:
                 self.trace_delete_threshold
             ))
 
-            # 3) numeric arrays (only the first n_words elements) (UNCHANGED)
+            # 3) numeric arrays (only the first n_words elements)
             f.write(np.ascontiguousarray(self.prof[:n_words],          dtype='<f4').tobytes())
             f.write(np.ascontiguousarray(self.vol[:n_words],           dtype='<f4').tobytes())
             f.write(np.ascontiguousarray(self.eff_prof[:n_words],      dtype='<f4').tobytes())
             f.write(np.ascontiguousarray(self.encounters[:n_words],    dtype='<u4').tobytes())
-            f.write(np.ascontiguousarray(self.last_decayed[:n_words],  dtype='<f8').tobytes())
+            # Save _word_last_decay_h (C++ vector) directly
+            if n_words > 0:
+                f.write(PyBytes_FromStringAndSize(<char*> self._word_last_decay_h.data(), self._word_last_decay_h.size() * sizeof(double)))
 
-            # 4) vocabulary (UNCHANGED)
-            for w in self.idx._i2w:
-                b = w.encode('utf-8')
-                f.write(struct.pack("<I", len(b)))
-                f.write(b)
+            # 4) vocabulary (ADAPTED to use _WordIndex's C++ internals)
+            f.write(struct.pack("<I", self.idx._i2w_cpp.size())) # Write number of words
+            cdef string word_cpp
+            for i in range(self.idx._i2w_cpp.size()):
+                word_cpp = self.idx._i2w_cpp[i]
+                f.write(struct.pack("<I", word_cpp.size())) # Write length of C++ string
+                f.write(PyBytes_FromStringAndSize(word_cpp.data(), word_cpp.size())) # Write C++ string data
 
             # 5) traces - Now directly save the C++ vector contents
             # Fixed-size data for each trace
             if n_traces > 0:
-                # Correctly construct bytes objects from the C++ vector data using PyBytes_FromStringAndSize
                 f.write(PyBytes_FromStringAndSize(<char*> self._trace_timestamps_h.data(), self._trace_timestamps_h.size() * sizeof(double)))
                 f.write(PyBytes_FromStringAndSize(<char*> self._trace_activations.data(), self._trace_activations.size() * sizeof(float)))
                 f.write(PyBytes_FromStringAndSize(<char*> self._trace_decay_factors.data(), self._trace_decay_factors.size() * sizeof(float)))
 
             # Variable-length word_ids: write length then data for each inner vector
             for i in range(n_traces):
-                current_trace_word_ids_cpp = self._trace_word_ids[i]
-                f.write(struct.pack("<I", current_trace_word_ids_cpp.size())) # Write length of this trace's word_ids
-                if current_trace_word_ids_cpp.size() > 0:
-                    # Correctly construct bytes object from the C++ vector data
-                    f.write(PyBytes_FromStringAndSize(<char*> current_trace_word_ids_cpp.data(), current_trace_word_ids_cpp.size() * sizeof(uint32_t)))
+                current_trace_word_ids_cpp_ptr = &self._trace_word_ids[i]
+                f.write(struct.pack("<I", current_trace_word_ids_cpp_ptr[0].size()))
+                if current_trace_word_ids_cpp_ptr[0].size() > 0:
+                    f.write(PyBytes_FromStringAndSize(<char*> current_trace_word_ids_cpp_ptr[0].data(), current_trace_word_ids_cpp_ptr[0].size() * sizeof(uint32_t)))
+            
+            # 6) word_to_traces (C++ unordered_map)
+            f.write(struct.pack("<I", self.word_to_traces.size()))
+            cdef pair[uint32_t, vector[int]] item
+            for item in self.word_to_traces:
+                f.write(struct.pack("<I", item.first))
+                f.write(struct.pack("<I", item.second.size()))
+                if item.second.size() > 0:
+                    f.write(PyBytes_FromStringAndSize(<char*> item.second.data(), item.second.size() * sizeof(int)))
+
+            # 7) Save priority queues (word_decay_pq, trace_decay_pq)
+            # Save size, then elements one by one (top to bottom)
+            f.write(struct.pack("<I", self._word_decay_pq.size()))
+            cdef priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]] temp_word_pq = self._word_decay_pq
+            while not temp_word_pq.empty():
+                item = temp_word_pq.top()
+                f.write(struct.pack("<dI", item.next_decay_time, item.id_or_idx))
+                temp_word_pq.pop()
+
+            f.write(struct.pack("<I", self._trace_decay_pq.size()))
+            cdef priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]] temp_trace_pq = self._trace_decay_pq
+            while not temp_trace_pq.empty():
+                item = temp_trace_pq.top()
+                f.write(struct.pack("<dI", item.next_decay_time, item.id_or_idx))
+                temp_trace_pq.pop()
+
 
     @classmethod
     def load_fast(cls, str path):
         cdef uint32_t n_words, n_traces, i, cnt, word_id_count
-        cdef double next_word_decay_appointment_h, next_trace_decay_appointment_h # New variables
         cdef bytes buf
         cdef tuple tpl
         cdef VocabularyModel m # Declare m as VocabularyModel type
 
-        cdef vector[uint32_t] current_trace_word_ids_cpp_ref # Reference to the inner vector
+        cdef vector[uint32_t]* current_trace_word_ids_cpp_ref
         cdef uint32_t word_id_val
+        cdef int trace_idx_val
+        cdef string word_cpp_buf
+        cdef double decay_time_val
+        cdef DecayItem loaded_decay_item
 
         # Temporary bytearrays for reading
         cdef bytearray temp_bytes_timestamps
         cdef bytearray temp_bytes_activations
         cdef bytearray temp_bytes_decay_factors
         cdef bytearray temp_bytes_word_ids
-
+        cdef bytearray temp_bytes_word_last_decayed
+        cdef bytearray temp_bytes_trace_indices
 
         with open(path, "rb") as f:
-            # read header (ADAPTED: 2 uint32_t and 2 double values)
-            buf = f.read(24) # 2*4 + 2*8 = 24 bytes
-            n_words, n_traces, next_word_decay_appointment_h, next_trace_decay_appointment_h = struct.unpack("<IIdd", buf)
+            # read header (ADAPTED: 2 uint32_t)
+            buf = f.read(8) # 2*4 = 8 bytes
+            n_words, n_traces = struct.unpack("<II", buf)
 
             # read your eight floats back
             buf = f.read(8 * 8)
             tpl = struct.unpack("<8d", buf)
-            m = cls(tpl[0], tpl[1], tpl[2], tpl[3],
-                            tpl[4], tpl[5], tpl[6], tpl[7])
-
-            # Set the loaded appointment times
-            m._next_word_decay_appointment_h = next_word_decay_appointment_h
-            m._next_trace_decay_appointment_h = next_trace_decay_appointment_h
-
+            m = cls(learning_rate=tpl[0], context_influence=tpl[1], activation_threshold=tpl[2],
+                    base_decay_rate=tpl[3], proficiency_min=tpl[4], proficiency_max=tpl[5],
+                    propagation_threshold=tpl[6], trace_delete_threshold=tpl[7])
 
             # numeric arrays
             m.prof          = np.frombuffer(f.read(n_words * 4), dtype='<f4').copy()
             m.vol           = np.frombuffer(f.read(n_words * 4), dtype='<f4').copy()
             m.eff_prof      = np.frombuffer(f.read(n_words * 4), dtype='<f4').copy()
             m.encounters    = np.frombuffer(f.read(n_words * 4), dtype='<u4').copy()
-            m.last_decayed  = np.frombuffer(f.read(n_words * 8), dtype='<f8').copy()
+            
+            # Read _word_last_decay_h (C++ vector)
+            m._word_last_decay_h.resize(n_words)
+            if n_words > 0:
+                temp_bytes_word_last_decayed = bytearray(n_words * sizeof(double))
+                f.readinto(temp_bytes_word_last_decayed)
+                memcpy(<char*> m._word_last_decay_h.data(), <char*> temp_bytes_word_last_decayed, n_words * sizeof(double))
 
-            # rebuild index
-            m.idx = _WordIndex.__new__(_WordIndex)
-            m.idx._i2w = []
-            m.idx._w2i = {}
-            for i in range(n_words):
+
+            # rebuild index (ADAPTED to use _WordIndex's C++ internals)
+            m.idx = _WordIndex.__new__(_WordIndex) # Create new instance
+            m.idx._w2i_cpp.clear() # Clear internal C++ map
+            m.idx._i2w_cpp.clear() # Clear internal C++ vector
+            
+            buf = f.read(4)
+            cdef uint32_t num_words_in_idx, word_len
+            num_words_in_idx, = struct.unpack("<I", buf)
+
+            for i in range(num_words_in_idx):
                 buf = f.read(4)
-                cnt, = struct.unpack("<I", buf)
-                w = f.read(cnt).decode('utf-8')
-                m.idx._i2w.append(w)
-                m.idx._w2i[w] = i
+                word_len, = struct.unpack("<I", buf)
+                word_cpp_buf = string(f.read(word_len)) # Read directly into C++ string
+                m.idx._i2w_cpp.push_back(word_cpp_buf)
+                m.idx._w2i_cpp[word_cpp_buf] = i
+
 
             # === REBUILD TRACE DATA FROM C++ VECTORS ===
-            # Resize C++ vectors to hold data
             m._trace_timestamps_h.resize(n_traces)
             m._trace_activations.resize(n_traces)
             m._trace_decay_factors.resize(n_traces)
-            m._trace_word_ids.resize(n_traces) # Resize outer vector
+            m._trace_word_ids.resize(n_traces)
 
-            # Read fixed-size trace data directly into C++ vector data pointers
             if n_traces > 0:
-                # Create a bytearray of the correct size
                 temp_bytes_timestamps = bytearray(n_traces * sizeof(double))
                 f.readinto(temp_bytes_timestamps)
-                # Copy data from the bytearray to the C++ vector
                 memcpy(<char*> m._trace_timestamps_h.data(), <char*> temp_bytes_timestamps, n_traces * sizeof(double))
 
                 temp_bytes_activations = bytearray(n_traces * sizeof(float))
@@ -726,27 +825,60 @@ cdef class VocabularyModel:
                 memcpy(<char*> m._trace_decay_factors.data(), <char*> temp_bytes_decay_factors, n_traces * sizeof(float))
 
 
-            m.word_to_traces = {} # Clear for rebuild
             for i in range(n_traces):
                 buf = f.read(4)
                 word_id_count, = struct.unpack("<I", buf)
 
-                # Access the i-th inner vector and resize it
-                current_trace_word_ids_cpp_ref = m._trace_word_ids[i]
-                current_trace_word_ids_cpp_ref.resize(word_id_count)
+                current_trace_word_ids_cpp_ref = &m._trace_word_ids[i]
+                current_trace_word_ids_cpp_ref[0].resize(word_id_count)
 
                 if word_id_count > 0:
-                    # Create a bytearray for this inner vector
                     temp_bytes_word_ids = bytearray(word_id_count * sizeof(uint32_t))
                     f.readinto(temp_bytes_word_ids)
-                    # Copy data from the bytearray to the C++ inner vector
-                    memcpy(<char*> current_trace_word_ids_cpp_ref.data(), <char*> temp_bytes_word_ids, word_id_count * sizeof(uint32_t))
+                    memcpy(<char*> current_trace_word_ids_cpp_ref[0].data(), <char*> temp_bytes_word_ids, word_id_count * sizeof(uint32_t))
 
+            # 6) Read word_to_traces (C++ unordered_map)
+            m.word_to_traces.clear()
+            buf = f.read(4)
+            cdef uint32_t map_size, vector_size, key_val
+            map_size, = struct.unpack("<I", buf)
 
-                # Rebuild reverse index (word_to_traces)
-                # Iterate through the C++ vector directly for efficiency
-                for word_id_val in current_trace_word_ids_cpp_ref:
-                    m.word_to_traces.setdefault(word_id_val, []).append(i)
+            for i in range(map_size):
+                buf = f.read(4)
+                key_val, = struct.unpack("<I", buf)
+
+                buf = f.read(4)
+                vector_size, = struct.unpack("<I", buf)
+
+                cdef vector[int] trace_indices_vec
+                trace_indices_vec.resize(vector_size)
+
+                if vector_size > 0:
+                    temp_bytes_trace_indices = bytearray(vector_size * sizeof(int))
+                    f.readinto(temp_bytes_trace_indices)
+                    memcpy(<char*> trace_indices_vec.data(), <char*> temp_bytes_trace_indices, vector_size * sizeof(int))
+                
+                m.word_to_traces[key_val] = trace_indices_vec
+
+            # 7) Load priority queues (word_decay_pq, trace_decay_pq)
+            cdef uint32_t pq_size
+            buf = f.read(4)
+            pq_size, = struct.unpack("<I", buf)
+            for i in range(pq_size):
+                buf = f.read(sizeof(double) + sizeof(uint32_t)) # double + uint32_t
+                decay_time_val, id_val = struct.unpack("<dI", buf)
+                loaded_decay_item.next_decay_time = decay_time_val
+                loaded_decay_item.id_or_idx = id_val
+                m._word_decay_pq.push(loaded_decay_item)
+
+            buf = f.read(4)
+            pq_size, = struct.unpack("<I", buf)
+            for i in range(pq_size):
+                buf = f.read(sizeof(double) + sizeof(uint32_t))
+                decay_time_val, id_val = struct.unpack("<dI", buf)
+                loaded_decay_item.next_decay_time = decay_time_val
+                loaded_decay_item.id_or_idx = id_val
+                m._trace_decay_pq.push(loaded_decay_item)
 
         return m
 

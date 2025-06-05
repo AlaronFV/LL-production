@@ -4,20 +4,29 @@
 cimport numpy as np
 
 # Import specific C-level declarations from the 'cy_utils.vocab_model' Cython module.
-# This assumes 'cy_utils.vocab_model' is itself a Cython module with a .pxd file
-# that defines 'VocabularyModel' as a cdef class and 'promotion_times' as a cpdef function.
 from cy_utils.vocab_model cimport VocabularyModel, promotion_times
 
-# Declare the 'cpdef' functions exposed by this Cython module.
-# These functions are accessible from both Python and other Cython modules at the C-level.
+# NEW: Imports for C++ containers
+from libcpp.unordered_map cimport unordered_map
+from libcpp.unordered_set cimport unordered_set
+from libcpp.string cimport string
 
-cpdef tuple predict_answer(VocabularyModel model,
-                            list words_py,
-                            bint build_promotion_data,
-                            object promotion_data)
+# ADAPTED: predict_answer_for_queue now returns int group
+cpdef tuple predict_answer_for_queue(VocabularyModel model,
+                                     list words_py,
+                                     unordered_map[string, int] &words_map_v_cpp, # Reference to C++ map for 'v'
+                                     unordered_map[string, unordered_set[int]] &words_map_i_cpp, # Reference to C++ map for 'i'
+                                     unordered_map[int, float] &sent_map_cpp, # Reference to C++ map for sentence map
+                                     int iid) # Item ID now passed directly
 """
-If build_promotion_data=False, returns float group (0.0/0.5/1.0).
-If build_promotion_data=True, returns (group:float, effs:ndarray).
+returns (group:int, effs:ndarray).
+"""
+
+# NEW: predict_answer_for_natural_candidates, returns int group
+cpdef int predict_answer_for_natural_candidates(VocabularyModel model,
+                                                 list words_py)
+"""
+Returns int group (0/1/2) without building promotion data.
 """
 
 cpdef set get_natural_candidates(list aligned_text,
@@ -29,7 +38,6 @@ current_indices: set of ints
 """
 
 # Declares a C-contiguous 1D NumPy array of floats as the input type for 'effs'.
-# This corresponds to the 'float[::1]' memoryview used in the .pyx file.
 cpdef float calculate_unknownness(float[::1] effs)
 """
 Return len(effs) - sum(effs), i.e. total ‘unknown mass’.
