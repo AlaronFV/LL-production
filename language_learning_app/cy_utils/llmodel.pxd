@@ -1,7 +1,7 @@
 # vocab_predictor.pxd
-
+#distutils: language = c++
 # C-level import for NumPy declarations
-cimport numpy as np
+cimport numpy as cnp
 
 # Import specific C-level declarations from the 'cy_utils.vocab_model' Cython module.
 from cy_utils.vocab_model cimport VocabularyModel, promotion_times

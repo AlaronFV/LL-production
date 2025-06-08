@@ -14,14 +14,7 @@ version = "0.1.0"
 description = "Language Learning App"
 requires-python = ">=3.12"
 # your runtime deps:
-dependencies = [
-  "streamlit==1.45.1",
-  "numpy>=1.20",
-  "heapdict",
-  "spacy",
-  "regex",
-  "orjson",
-]
+dependencies = ["numpy>=1.20"]
 
 # tell setuptools to find your packages
 [tool.setuptools.packages.find]

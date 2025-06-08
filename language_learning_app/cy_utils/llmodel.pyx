@@ -1,9 +1,10 @@
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: wraparound=False
+#distutils: language = c++
 
 from cy_utils.vocab_model cimport VocabularyModel, promotion_times
-cimport numpy as np
+cimport numpy as cnp
 from collections import defaultdict
 from libcpp.vector cimport vector
 from libcpp.algorithm cimport sort
@@ -13,7 +14,7 @@ from libcpp.string cimport string
 from cython.operator cimport dereference as deref
 
 # Tell Cython about our numpy dtypes
-np.import_array()
+cnp.import_array()
 
 # ADAPTED: predict_answer_for_queue now returns int group
 cpdef tuple predict_answer_for_queue(VocabularyModel model,

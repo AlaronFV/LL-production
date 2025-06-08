@@ -1,6 +1,7 @@
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: wraparound=False
+#distutils: language = c++
 
 from cy_utils.vocab_model cimport VocabularyModel
 from cy_utils.llmodel cimport predict_answer_for_queue, calculate_unknownness
@@ -21,20 +22,15 @@ from libcpp.utility cimport pair
 
 # Threading specific imports
 from libcpp.thread cimport thread
-from libcpp.mutex cimport mutex
+from libcpp.mutex cimport mutex, unique_lock # Import unique_lock here
 from libcpp.condition_variable cimport condition_variable
 from libcpp.chrono cimport milliseconds # For potential sleep/timeout
 
 from cython.operator cimport dereference as deref
 
-from cy_utils.queue cimport LearningQueue, HeapItem # Import self for type hinting within C++ function
-
-# Custom comparator for the priority queue (defined in pxd)
-cdef cppclass HeapComparator:
-    bint operator()(const HeapItem& a, const HeapItem& b) const:
-        if a.key != b.key:
-            return a.key > b.key
-        return a.insertion_order > b.insertion_order
+# Import the specialized priority queue type and HeapComparator from pxd
+# HeapComparator is now imported from pxd which declares it from the .h file
+from cy_utils.queue cimport LearningQueue, HeapItem, priority_queue_HeapItem, HeapComparator
 
 
 cdef class LearningQueue:
@@ -47,10 +43,12 @@ cdef class LearningQueue:
         self.lang      = lang
         self.tmodel    = master.get_or_create_model(lang)
         
-        self._heaps_cpp = unordered_map[int, priority_queue[HeapItem, vector[HeapItem], HeapComparator]]()
-        self._heaps_cpp[0] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
-        self._heaps_cpp[1] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
-        self._heaps_cpp[2] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+        # Initialize with the specialized type defined in pxd
+        # Pass the HeapComparator instance to the constructor
+        self._heaps_cpp = unordered_map[int, priority_queue_HeapItem]()
+        self._heaps_cpp[0] = priority_queue_HeapItem(HeapComparator())
+        self._heaps_cpp[1] = priority_queue_HeapItem(HeapComparator())
+        self._heaps_cpp[2] = priority_queue_HeapItem(HeapComparator())
 
         self.items     = {}
         self.i2g       = {}
@@ -77,23 +75,31 @@ cdef class LearningQueue:
     def __dealloc__(self):
         # Ensure worker thread is stopped and joined when object is deallocated
         self._stop_worker_thread()
+        # Clean up dynamically allocated thread object
+        if self._worker_thread != NULL:
+            del self._worker_thread
+            self._worker_thread = NULL
 
     cdef void _start_worker_thread(self):
         if not self._worker_running:
             self._worker_running = True
             # Pass 'self' to the C++ thread function to allow it to call methods
+            # Use 'new' to dynamically allocate the thread object
             self._worker_thread = new thread(self._background_dirty_processor_thread_func, self)
 
     cdef void _stop_worker_thread(self):
         if self._worker_running:
-            with nogil: # Acquire lock without GIL
+            # Acquire mutex to safely signal stop and notify worker
+            with self._dirty_queue_mutex:
                 self._worker_running = False # Signal worker to stop
                 self._dirty_queue_cv.notify_all() # Wake up worker if it's waiting
-            if self._worker_thread.joinable(): # Check if joinable before joining
+            
+            # Join the thread outside the mutex lock to avoid deadlock if worker tries to acquire it
+            if self._worker_thread != NULL and self._worker_thread.joinable(): # Check if joinable before joining
                 self._worker_thread.join() # Wait for worker to finish
-            del self._worker_thread # Delete the thread object
-            self._worker_thread = NULL
-            self._worker_running = False
+            
+            # The 'del self._worker_thread' is moved to __dealloc__
+            self._worker_running = False # Reset flag
 
     cdef void _signal_worker_pause(self):
         with self._dirty_queue_mutex: # Protect the flag
@@ -109,8 +115,11 @@ cdef class LearningQueue:
         # This is called by the main thread to ensure the worker is not processing
         # when the main thread needs to modify shared data.
         with self._dirty_queue_mutex:
-            while self._is_processing_dirty: # Wait while worker is actively processing
-                self._dirty_queue_cv.wait(self._dirty_queue_mutex)
+            # Wait while worker is actively processing or if it's paused but not yet idle
+            # Note: The condition here is critical. Wait if the worker is *processing* dirty items.
+            # If it's merely paused and not processing, you might not need to wait.
+            # The `_is_processing_dirty` flag is key.
+            self._dirty_queue_cv.wait(self._dirty_queue_mutex, lambda: not self._is_processing_dirty)
 
     cdef void _background_dirty_processor_thread_func(self, LearningQueue self):
         # This function runs in a C++ thread, so it starts without the GIL
@@ -118,34 +127,43 @@ cdef class LearningQueue:
         cdef int processed_count
         cdef int iid_to_process
         cdef bint item_exists
+        cdef unique_lock[mutex] lock
 
         while True:
-            # Lock to check state and access dirty queue
-            with self._dirty_queue_mutex:
-                # Wait if paused or if queue is empty and not stopping
-                # Use std::unique_lock for condition_variable
-                cdef unique_lock[mutex] lock(self._dirty_queue_mutex)
-                while (self._worker_paused or self._dirty_items.empty()) and self._worker_running:
-                    self._dirty_queue_cv.wait(lock)
-                
-                if not self._worker_running: # Check stop signal after waking up
-                    break # Exit thread loop
+            # 1. Acquire the unique_lock for the mutex
+            lock(self._dirty_queue_mutex)
+            
+            # 2. Wait until conditions are met to proceed (not paused, not empty, or stopping)
+            # The 'wait' method releases the lock before waiting and re-acquires it on notification.
+            while (self._worker_paused or self._dirty_items.empty()) and self._worker_running:
+                self._dirty_queue_cv.wait(lock)
+            
+            # 3. Check stop signal immediately after waking up
+            if not self._worker_running:
+                break # Exit thread loop
 
-                self._is_processing_dirty = True # Indicate processing is active
+            # 4. Indicate that the worker is actively processing (while holding the lock)
+            self._is_processing_dirty = True
 
-            # Process a batch of items (release GIL for C++ deque ops)
+            # 5. Process a batch of items
             processed_count = 0
             while processed_count < items_to_process_per_batch:
                 item_exists = False
 
-                with self._dirty_queue_mutex: # Protect _dirty_items for front/pop_front
-                    if self._dirty_items.empty() or self._worker_paused:
-                        break # No more items or paused, break from batch processing
-                    iid_to_process = self._dirty_items.front()
-                    self._dirty_items.pop_front()
+                # Check if there are items to process or if we should pause (still under mutex)
+                if self._dirty_items.empty() or self._worker_paused:
+                    break # No more items or paused, break from batch processing
+
+                # Get item from queue (still under mutex)
+                iid_to_process = self._dirty_items.front()
+                self._dirty_items.pop_front()
                 
-                # Acquire GIL for Python object access and method calls
-                with gil:
+                # Release C++ lock to acquire GIL for Python object access and method calls
+                with nogil: # Ensures C++ lock is released
+                    lock.unlock() # Explicitly unlock C++ mutex before acquiring GIL
+                
+                with gil: # Acquire GIL
+                    # Inside GIL, the C++ mutex is NOT held.
                     if iid_to_process in self.items:
                         # Call update_item directly, passing iid_to_process
                         self.update_item(iid_to_process, datetime.now().timestamp() / 3600.0)
@@ -153,25 +171,31 @@ cdef class LearningQueue:
                     else:
                         item_exists = False # Item was removed by other means
 
+                # Re-acquire C++ lock after releasing GIL (for the next iteration or loop exit)
+                with nogil: # Ensures GIL is released
+                    lock.lock() # Re-acquire C++ mutex
+
                 if item_exists:
                     processed_count += 1
                 
-                # Small pause to yield control, if needed (optional, GIL release/acquire already yields)
+                # Small pause to yield control, if needed (optional)
                 # std::this_thread::sleep_for(milliseconds(1)); # Requires <chrono> and <thread>
 
-            with self._dirty_queue_mutex: # Re-acquire lock to update processing status
-                self._is_processing_dirty = False # Indicate processing is done for this batch
-                # If queue is empty after this batch, notify main thread if it's waiting for queue to empty
-                if self._dirty_items.empty():
-                    self._dirty_queue_cv.notify_all()
+            # 6. After processing the batch, update status while holding the lock
+            self._is_processing_dirty = False # Indicate processing is done for this batch
+            # 7. Notify main thread if queue is empty or processing is done
+            if self._dirty_items.empty():
+                self._dirty_queue_cv.notify_all() # Notify any threads waiting for _is_processing_dirty to be false or queue empty
 
-        # Thread is stopping
+            # 'lock' automatically releases the mutex when it goes out of scope at the end of this `while True` loop iteration.
+
+        # Thread is stopping, 'lock' will be destroyed and mutex released.
         pass
 
     cpdef void add_item(self,
-                         object item,
-                         int iid,
-                         double now_h):
+                        object item,
+                        int iid,
+                        double now_h):
         """
         Score a single item and push it into the appropriate heap.
         """
@@ -187,7 +211,8 @@ cdef class LearningQueue:
         for w_str in item["unit"]["words"]:
             if self.tmodel.idx.has_word(w_str):
                 wid = self.tmodel.idx.get_id(w_str)
-                with self._dirty_queue_mutex: # Protect inverted_cpp if accessed by worker
+                # Protect inverted_cpp if accessed by worker (it is)
+                with self._dirty_queue_mutex:
                     self.inverted_cpp[wid].push_back(iid)
 
         self._add_to_heap(iid, grp, key)
@@ -205,7 +230,7 @@ cdef class LearningQueue:
         cdef Py_ssize_t n = len(items)
         cdef double now_h = datetime.now().timestamp() / 3600.0
         for i in range(n):
-            # No need to protect _dirty_items here as worker is paused
+            # No need to protect _dirty_items here as worker is paused and _add_to_heap takes care of its lock
             # Call add_item directly, accessing maps from self
             self.add_item(items[i], i, now_h)
         
@@ -217,20 +242,25 @@ cdef class LearningQueue:
         No longer directly processes dirty items.
         """
         # The background thread handles dirty item processing.
-        # Ensure the worker is running and not paused before peeking if it's expected to clear the queue.
-        # If the queue is empty, we might want to wait for the worker to finish.
         # For peek, we don't necessarily need to wait for the worker to finish.
+        # Just need to protect the heap access itself.
         
-        cdef priority_queue[HeapItem, vector[HeapItem], HeapComparator] *heap_ptr
+        cdef priority_queue_HeapItem *heap_ptr
         if self._heaps_cpp.count(grp) == 0:
             return None, None
         
-        heap_ptr = &self._heaps_cpp.at(grp)
-        if heap_ptr[0].empty():
-            return None, None
-        
-        cdef HeapItem top_item = heap_ptr[0].top()
-        return self.items[top_item.iid], top_item.iid
+        cdef HeapItem top_item
+
+        # Protect heap access
+        with self._dirty_queue_mutex:
+            heap_ptr = &self._heaps_cpp.at(grp)
+            if heap_ptr[0].empty():
+                return None, None
+            
+            top_item = heap_ptr[0].top()
+            # Return a copy of the item; actual removal happens in pop_next
+            # Use self.items[top_item.iid] to get the Python object
+            return self.items[top_item.iid], top_item.iid
 
     cpdef tuple pop_next(self, int grp):
         """
@@ -239,19 +269,24 @@ cdef class LearningQueue:
         """
         # Similar to peek_next, rely on background thread for processing.
         
-        cdef priority_queue[HeapItem, vector[HeapItem], HeapComparator] *heap_ptr
+        cdef priority_queue_HeapItem *heap_ptr
         if self._heaps_cpp.count(grp) == 0:
             return None, None
         
-        heap_ptr = &self._heaps_cpp.at(grp)
-        if heap_ptr[0].empty():
-            return None, None
+        cdef HeapItem top_item
+
+        # Protect heap modification
+        with self._dirty_queue_mutex:
+            heap_ptr = &self._heaps_cpp.at(grp)
+            if heap_ptr[0].empty():
+                return None, None
+            
+            top_item = heap_ptr[0].top()
+            heap_ptr[0].pop() # Remove from C++ heap
         
-        cdef HeapItem top_item = heap_ptr[0].top()
-        heap_ptr[0].pop()
-        
-        self.i2g.pop(top_item.iid, None)
-        return self.items.pop(top_item.iid), top_item.iid
+            # Remove from Python dicts
+            self.i2g.pop(top_item.iid, None)
+            return self.items.pop(top_item.iid), top_item.iid
 
     cpdef void remove_item(self, int iid):
         """
@@ -259,9 +294,11 @@ cdef class LearningQueue:
         """
         # ADAPTED: grp is int
         grp = self.i2g.pop(iid, -1)
-        if grp != -1:
-            pass
-
+        # Note: If an item is removed from a heap (by popping), it's truly gone.
+        # If it's removed by this method, it's just removed from i2g and items.
+        # For the C++ heap, a "soft delete" (pushing with high key) was done in _add_to_heap.
+        # The actual removal from the heap happens when it's popped.
+        
         cdef str w_str
         cdef uint32_t wid
         cdef vector[int]* iids_vec_ptr
@@ -271,6 +308,8 @@ cdef class LearningQueue:
         
         cdef Py_ssize_t k
 
+        # Remove from inverted_cpp. This section must be mutex-protected.
+        # The worker thread also reads/modifies inverted_cpp.
         for w_str in self.items[iid]["unit"]["words"]:
             if self.tmodel.idx.has_word(w_str):
                 wid = self.tmodel.idx.get_id(w_str)
@@ -278,14 +317,18 @@ cdef class LearningQueue:
                     if self.inverted_cpp.count(wid) > 0:
                         iids_vec_ptr = &self.inverted_cpp.at(wid)
                         
+                        # Find and erase the iid from the vector
+                        # This loop iterates through the vector.
+                        # It's O(N) for the vector, but safe within the lock.
                         for k in range(iids_vec_ptr[0].size()):
                             if iids_vec_ptr[0][k] == iid:
                                 iids_vec_ptr[0].erase(iids_vec_ptr[0].begin() + k)
                                 break
+                        # If vector becomes empty, remove the word_id entry from the map
                         if iids_vec_ptr[0].empty():
                             self.inverted_cpp.erase(wid)
 
-        self.items.pop(iid, None)
+        self.items.pop(iid, None) # Remove from Python dict
 
     cpdef void process_answer(self, int iid, int feedback_level):
         """
@@ -301,8 +344,8 @@ cdef class LearningQueue:
         self.master.update_knowledge(item["unit"]["words"],
                                      self.lang,
                                      feedback_level)
-        self.remove_item(iid)
-        
+        self.remove_item(iid) # This will also update inverted_cpp
+
         cdef set changed_words_py = set(item["unit"]["words"])
         cdef set deps_to_add_to_dirty_queue = set()
 
@@ -316,29 +359,32 @@ cdef class LearningQueue:
             w_cpp_key = w_str.encode('utf-8')
             # Protect these maps during modification by the main thread
             with self._dirty_queue_mutex:
-                self._words_map_v_cpp.erase(w_cpp_key)
-                self._words_map_i_cpp.erase(w_cpp_key)
+                self._words_map_v_cpp.erase(w_cpp_key) # Clear cached values
+                self._words_map_i_cpp.erase(w_cpp_key) # Clear cached values
             
             if self.tmodel.idx.has_word(w_str):
                 wid = self.tmodel.idx.get_id(w_str)
-                # No need to protect inverted_cpp here, as worker is paused
-                if self.inverted_cpp.count(wid) > 0:
-                    iids_vec_ptr = &self.inverted_cpp.at(wid)
-                    for d_iid in iids_vec_ptr[0]:
-                        deps_to_add_to_dirty_queue.add(d_iid)
+                # inverted_cpp is protected by remove_item via its mutex
+                # No extra mutex needed here *if* remove_item handles all necessary locks for inverted_cpp.
+                # Since inverted_cpp is protected by self._dirty_queue_mutex in remove_item,
+                # and this `process_answer` function pauses the worker and takes over,
+                # it's safe to directly access inverted_cpp here *after* remove_item.
+                # However, adding a `with self._dirty_queue_mutex:` here too is safer for consistency.
+                with self._dirty_queue_mutex:
+                    if self.inverted_cpp.count(wid) > 0:
+                        iids_vec_ptr = &self.inverted_cpp.at(wid)
+                        for d_iid in iids_vec_ptr[0]:
+                            deps_to_add_to_dirty_queue.add(d_iid)
 
         for d_iid in deps_to_add_to_dirty_queue:
-            if d_iid in self.items:
+            if d_iid in self.items: # Only re-add if item still exists
                 with self._dirty_queue_mutex: # Protect _sent_map_cpp and _dirty_items when adding
-                    self._sent_map_cpp.erase(d_iid)
-                    self._dirty_items.push_back(d_iid)
-        
+                    self._sent_map_cpp.erase(d_iid) # Invalidate cached sentence score
+                    self._dirty_items.push_back(d_iid) # Add to dirty queue for re-scoring
+                    self._dirty_queue_cv.notify_one() # Notify worker that there's a new item
+
         # 3. Signal worker to resume after adding new items
         self._signal_worker_resume()
-
-    # _process_dirty_items is now internal to the background thread's logic
-    # It is no longer a cpdef method.
-    # cpdef void _process_dirty_items(self, int max_items_to_process, double now_h):
 
     cpdef void update_item(self,
                            int iid,
@@ -350,6 +396,7 @@ cdef class LearningQueue:
         cdef int grp
         cdef float key
         # Call _score_and_group directly, accessing maps from self
+        # This function internally handles locking for accesses to _words_map_v_cpp etc.
         grp, key = self._score_and_group(self.items[iid], iid, now_h)
         self._add_to_heap(iid, grp, key)
 
@@ -358,11 +405,11 @@ cdef class LearningQueue:
         Total size of all queues, or size of one group.
         """
         cdef Py_ssize_t tot
-        cdef unordered_map[int, priority_queue[HeapItem, vector[HeapItem], HeapComparator]].iterator it
+        cdef unordered_map[int, priority_queue_HeapItem].iterator it # Use specialized type here
         if grp == -1:
             tot = 0
-            # Need to protect _heaps_cpp if worker might modify it (unlikely for group keys)
-            # but safer to assume it's shared.
+            # Need to protect _heaps_cpp as worker might modify it (though group keys are stable).
+            # Safer to assume it's shared.
             with self._dirty_queue_mutex: # Reusing the mutex for general shared data access
                 for it in self._heaps_cpp.begin():
                     tot += deref(it).second.size()
@@ -384,16 +431,17 @@ cdef class LearningQueue:
         cdef float key
         cdef float[::1] effs
 
-        # Pass self's C++ member maps directly to the external C function
-        (grp, effs) = predict_answer_for_queue(self.tmodel, words, True,
-                                              self._words_map_v_cpp, self._words_map_i_cpp, self._sent_map_cpp, iid)
+        # Acquire mutex before accessing/modifying shared C++ maps
+        with self._dirty_queue_mutex:
+            (grp, effs) = predict_answer_for_queue(self.tmodel, words,
+                                                   self._words_map_v_cpp, self._words_map_i_cpp, self._sent_map_cpp, iid)
 
-        if grp == 0:
-            key = calculate_unknownness(effs)
-        elif grp == 2:
-            key = self.tmodel.predict_understanding(words, now_h)
-        else:
-            key = self._promotion_potential(words, effs, now_h)
+            if grp == 0:
+                key = calculate_unknownness(effs)
+            elif grp == 2:
+                key = self.tmodel.predict_understanding(words, now_h)
+            else: # grp == 1
+                key = self._promotion_potential(words, effs, now_h)
 
         return grp, key
 
@@ -403,26 +451,31 @@ cdef class LearningQueue:
         """
         cdef int old_grp = self.i2g.get(iid, -1)
         
-        # This section needs to be protected if multiple threads add/remove items
+        # This section needs to be protected as it modifies _heaps_cpp and i2g,
+        # which are shared with other methods (like pop_next, size, process_answer).
+        cdef HeapItem dummy_item
+        cdef HeapItem new_heap_item
         with self._dirty_queue_mutex: # Protect heap modifications and i2g
             if old_grp != -1 and old_grp != grp:
                 if self._heaps_cpp.count(old_grp) > 0:
-                    cdef HeapItem dummy_item
-                    dummy_item.key = 1e9 # Very high key to send it to bottom
-                    dummy_item.insertion_order = next(self.counter)
+                    # Push a dummy item to effectively "remove" the old one from the heap.
+                    # It will eventually be popped when it reaches the top.
+                    dummy_item.key = 1e9 # Very high key to send it to bottom (effectively delete)
+                    dummy_item.insertion_order = next(self.counter) # Needs a unique ID
                     dummy_item.iid = iid
                     self._heaps_cpp.at(old_grp).push(dummy_item)
 
-            cdef HeapItem new_heap_item
+            
             new_heap_item.key = key
-            new_heap_item.insertion_order = next(self.counter)
+            new_heap_item.insertion_order = next(self.counter) # Get a new unique insertion order
             new_heap_item.iid = iid
             
+            # Ensure the heap for this group exists before pushing
             if self._heaps_cpp.count(grp) == 0:
-                self._heaps_cpp[grp] = priority_queue[HeapItem, vector[HeapItem], HeapComparator](HeapComparator())
+                self._heaps_cpp[grp] = priority_queue_HeapItem(HeapComparator()) # Initialize with comparator
             
             self._heaps_cpp.at(grp).push(new_heap_item)
-            self.i2g[iid] = grp
+            self.i2g[iid] = grp # Update i2g to the new group
 
     cpdef float _promotion_potential(self, list words, float[::1] eff_prof, double now_h):
         """
@@ -444,10 +497,7 @@ cdef class LearningQueue:
 
         for w_str in words:
             w_cpp_key = w_str.encode('utf-8')
-            # These lookups are read-only, so no mutex needed here if maps are only written by main thread
-            # or if writes are protected and reads are eventually consistent.
-            # However, since the worker thread also reads/writes to these maps,
-            # they must be protected for *all* access points.
+            # Protect these lookups as they are shared with the worker thread
             with self._dirty_queue_mutex:
                 words_map_v_it = self._words_map_v_cpp.find(w_cpp_key)
                 words_map_i_it = self._words_map_i_cpp.find(w_cpp_key)

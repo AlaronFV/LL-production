@@ -21,13 +21,19 @@ cdef extern from "<utility>" namespace "std":
         T1 first
         T2 second
 
-# NEW: Custom comparator for decay scheduling priority queue
-cdef cppclass DecayItem:
-    double next_decay_time
-    uint32_t id_or_idx # Can be word_id or trace_idx
+# NEW: Custom comparator for decay scheduling priority queue (declared from external header)
+cdef extern from "cy_utils/decay_item.h": # Point to the new header file
+    cdef cppclass DecayItem:
+        double next_decay_time
+        uint32_t id_or_idx # Can be word_id or trace_idx
+        bint operator<(const DecayItem& other) const # Declare the operator
 
-    bint operator<(const DecayItem& other) const:
-        return next_decay_time < other.next_decay_time # Min-heap based on time
+# Declare a specific Cython-visible type for std::priority_queue<DecayItem, std::vector<DecayItem>, std::greater<DecayItem>>
+# This explicitly tells Cython how to refer to this C++ specialization.
+cdef extern from "<queue>" namespace "std":
+    cdef cppclass priority_queue_DecayItem "std::priority_queue<DecayItem, std::vector<DecayItem>, std::greater<DecayItem>>":
+        # No members are needed here, as we are just declaring the specific type alias.
+        pass
 
 # ---------------------------------------------------------------------------
 #   WordIndex: bidirectional str <-> uint32 (ADAPTED for C++ internals)
@@ -79,8 +85,8 @@ cdef class VocabularyModel:
     cdef float trace_delete_threshold
 
     # NEW: Priority queues for intelligent decay scheduling
-    cdef priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]] _word_decay_pq
-    cdef priority_queue[DecayItem, vector[DecayItem], greater[DecayItem]] _trace_decay_pq
+    cdef priority_queue_DecayItem _word_decay_pq
+    cdef priority_queue_DecayItem _trace_decay_pq
 
 
     # cdef methods

@@ -1,4 +1,5 @@
 # cy_utils/queue.pxd
+# distutils: language = c++
 
 # C-level import for NumPy declarations
 cimport numpy as np
@@ -6,6 +7,8 @@ cimport numpy as np
 # C-level imports for custom Cython modules
 from cy_utils.vocab_model cimport VocabularyModel
 from cy_utils.llmodel cimport predict_answer_for_queue, calculate_unknownness
+
+from libc.stdint cimport uint32_t
 
 # NEW: C++ containers and threading primitives
 from libcpp.unordered_map cimport unordered_map
@@ -22,16 +25,28 @@ from libcpp.thread cimport thread
 from libcpp.mutex cimport mutex
 from libcpp.condition_variable cimport condition_variable
 
-# HeapItem and HeapComparator remain the same, their key is float for the score
-cdef cppclass HeapItem:
-    float key
-    long long insertion_order
-    int iid
+# Define HeapItem in a separate header and declare it here
+cdef extern from "cy_utils/heap_item.h":
+    cdef cppclass HeapItem:
+        float key
+        long long insertion_order
+        int iid
+        bint operator<(const HeapItem& other) const
 
-    bint operator<(const HeapItem& other) const:
-        if key != other.key:
-            return key > other.key
-        return insertion_order > other.insertion_order
+# Declare HeapComparator from its own C++ header
+# The actual implementation of operator() is in cy_utils/heap_comparator.h
+cdef extern from "cy_utils/heap_comparator.h":
+    cdef cppclass HeapComparator:
+        # No need to redeclare operator() here; just the class itself
+        pass
+
+# Declare a specific Cython-visible type for std::priority_queue<HeapItem, std::vector<HeapItem>, HeapComparator>
+# This avoids the "priority_queue templated type receives 1 arguments, got 3" error
+cdef extern from "<queue>" namespace "std":
+    # Use the full C++ qualified name for the specialized type
+    cdef cppclass priority_queue_HeapItem "std::priority_queue<HeapItem, std::vector<HeapItem>, HeapComparator>":
+        # No members are needed here; this is just a type alias.
+        pass
 
 # Declare the cdef class 'LearningQueue'.
 cdef class LearningQueue:
@@ -44,7 +59,8 @@ cdef class LearningQueue:
     cdef str lang
 
     # ADAPTED: Heaps use int keys for groups
-    cdef unordered_map[int, priority_queue[HeapItem, vector[HeapItem], HeapComparator]] _heaps_cpp
+    # Use the specialized type defined above
+    cdef unordered_map[int, priority_queue_HeapItem] _heaps_cpp
 
     cdef dict items
     cdef dict i2g                         # ADAPTED: i2g maps iid(int) → group(int)
@@ -53,11 +69,11 @@ cdef class LearningQueue:
     cdef unordered_map[string, unordered_set[int]] _words_map_i_cpp
     cdef unordered_map[int, float] _sent_map_cpp
 
-    cdef public unordered_map[uint32_t, vector[int]] inverted_cpp
+    cdef unordered_map[uint32_t, vector[int]] inverted_cpp
     
     cdef object counter
     
-    cdef public deque[int] _dirty_items
+    cdef deque[int] _dirty_items
 
     # NEW: Threading related members
     cdef thread *_worker_thread # Pointer to C++ thread object
@@ -70,15 +86,16 @@ cdef class LearningQueue:
     # New cdef methods for thread management
     cdef void _start_worker_thread(self)
     cdef void _stop_worker_thread(self)
-    cdef void _background_dirty_processor_thread_func(self, LearningQueue self) # Add self here for proper type hinting
+    # The 'self' argument is crucial for C++ thread function pointers to call methods on the object
+    cdef void _background_dirty_processor_thread_func(self, LearningQueue self)
     cdef void _signal_worker_pause(self) # For main thread to signal pause
     cdef void _signal_worker_resume(self) # For main thread to signal resume
     cdef void _wait_for_worker_to_pause(self) # For main thread to wait for worker to pause
 
     cpdef void add_item(self,
-                         object item,
-                         int iid,
-                         double now_h)
+                        object item,
+                        int iid,
+                        double now_h)
 
     cpdef void build_from_input(self, list items)
 
