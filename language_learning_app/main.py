@@ -97,9 +97,8 @@ class LanguageLearningModel:
         if not words:
             return None
         mdl = self.get_or_create_model(language)
-        ts = datetime.datetime.now().timestamp() / 3600.0
 
-        mdl.update_proficiency(words, feedback_level / 2, ts)
+        mdl.update_from_words(words, feedback_level / 2)
         self.save_model(language)
 
     def reset_vocabulary(self, language=None):
@@ -276,8 +275,7 @@ def queue_view(model_service, lang):
 
     st.info(f'Queue contains {total} items. \n\n"Didn\'t understand" ({q0_size}), "Partially understood" ({q1_size}), "Fully understood" ({q2_size}).')
 
-    group = 2 if q2_size else (1 if q1_size else 0)
-    current_iid, group = queue.pop_next()
+    current_iid = queue.pop_next()
     if current_iid is None:
         st.warning("Queue is empty or contains only invalid items.")
         return
@@ -390,12 +388,17 @@ def main():
         st.session_state.update({"show_queue_view": not st.session_state.show_queue_view, "force_state_reset": True})
         if st.session_state.show_queue_view:
             st.session_state.queue_source_revealed = False
+        else:
+            st.session_state.pop("iid_to_item_map", None)
+            st.session_state.pop("learning_queue_obj", None)
+            st.session_state.pop("learning_queue_target", None)
         st.rerun()
 
     if st.session_state.show_queue_view:
         queue_view(model, target_language)
         return
 
+    
     
     # build an index of the NDJSON
     input_nd = Path("input") / f"{target_language}.ndjson"
@@ -457,8 +460,6 @@ def main():
             if k not in [
                 "language_model",
                 "show_queue_view",
-                "learning_queue_obj",
-                "learning_queue_target",
                 "current_file",
                 "current_num_index",
                 "force_state_reset",

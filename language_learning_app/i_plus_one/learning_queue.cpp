@@ -4,7 +4,6 @@
 #include <stdexcept>
 #include <numeric>
 #include <algorithm>
-#include <set>
 
 namespace i_plus_one {
 
@@ -19,40 +18,51 @@ LearningQueue::LearningQueue(std::shared_ptr<VocabularyModel> model) : tmodel(mo
 
 void LearningQueue::build_from_input(const py::list& items) {
     py::gil_scoped_acquire acquire;
-    int iid_counter = 0; // CHANGED: Use a simple counter for iid
+    int iid_counter = 0;
     double now_h = std::chrono::duration_cast<std::chrono::duration<double, std::ratio<3600>>>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     for (const auto& item_handle : items) {
         py::dict item = item_handle.cast<py::dict>();
-        int iid = iid_counter++; // CHANGED
-        
-        if (active_iids.count(iid)) continue;
         
         std::vector<std::string> words = item["unit"]["words"].cast<std::vector<std::string>>();
-        _add_item_internal(iid, words, now_h);
+        _add_item_internal(iid_counter, words, now_h);
+        iid_counter++;
     }
 }
 
-// CHANGED: Operates on vector of strings
 void LearningQueue::_add_item_internal(int iid, const std::vector<std::string>& words, double now_h) {
-    // We only update the inverted index for words that are *currently* in the model.
-    // This index is used for finding dependents, so it must be based on valid IDs.
+    std::vector<uint32_t> word_ids;
+    word_ids.reserve(words.size());
     for (const auto& w : words) {
-        if (tmodel->get_idx().has_word(w)) {
-            uint32_t wid = tmodel->get_idx().get_id(w);
-            word_id_to_iids[wid].push_back(iid);
-        }
+        uint32_t wid = tmodel->get_idx().get_id(w);
+        word_ids.push_back(wid);
+        word_id_to_iids[wid].push_back(iid);
     }
-    // Note: We do not call _resize_arrays here. The model grows when words are learned, not just seen.
+    // CRITICAL FIX: No longer call _resize_arrays here.
+    // The model now handles its own arrays only when a word is processed.
 
-    item_words[iid] = words; // Store the original strings
+    item_word_ids[iid] = word_ids;
     active_iids.insert(iid);
 
-    auto [grp, key] = _score_and_group(iid, words, now_h);
+    auto [grp, key] = _score_and_group(iid, word_ids, now_h);
     _add_to_heap(iid, grp, key);
     
     _active_heap_sizes[grp]++;
+}
+
+std::pair<int, float> LearningQueue::_score_and_group(int iid, const std::vector<uint32_t>& word_ids, double now_h) {
+    auto [grp, effs] = predict_answer_for_queue(*tmodel, word_ids, _words_map_v, _words_map_i, _sent_map, iid);
+    
+    float key;
+    if (grp == 0) {
+        key = calculate_unknownness(effs);
+    } else if (grp == 2) {
+        key = tmodel->_predict_understanding_by_id(word_ids, now_h);
+    } else {
+        key = _promotion_potential(word_ids, effs, now_h);
+    }
+    return {grp, key};
 }
 
 void LearningQueue::_add_to_heap(int iid, int grp, float key) {
@@ -60,7 +70,7 @@ void LearningQueue::_add_to_heap(int iid, int grp, float key) {
     iid_to_group[iid] = grp;
 }
 
-py::tuple LearningQueue::pop_next() {
+int LearningQueue::pop_next() {
     int grp_to_pop = -1;
     if (_active_heap_sizes[2] > 0) grp_to_pop = 2;
     else if (_active_heap_sizes[1] > 0) grp_to_pop = 1;
@@ -68,7 +78,7 @@ py::tuple LearningQueue::pop_next() {
 
     if (grp_to_pop == -1) {
         py::gil_scoped_acquire acquire;
-        return py::make_tuple(py::none(), py::none());
+        return -1;
     }
     
     while (!_heaps[grp_to_pop].empty()) {
@@ -77,55 +87,48 @@ py::tuple LearningQueue::pop_next() {
 
         if (active_iids.count(top_item.iid)) {
             py::gil_scoped_acquire acquire;
-            // The python side will fetch the item's content using the iid
-            return py::make_tuple(top_item.iid, iid_to_group[top_item.iid]);
+            return top_item.iid;
         }
     }
     
     py::gil_scoped_acquire acquire;
-    return py::make_tuple(py::none(), py::none());
+    return -1;
 }
 
 void LearningQueue::process_answer(int iid, int feedback_level) {
     if (!active_iids.count(iid)) return;
 
-    // CHANGED: Retrieve the word strings for the answered item
-    const auto& words = item_words.at(iid);
+    const auto& word_ids = item_word_ids.at(iid);
     double now_h = std::chrono::duration_cast<std::chrono::duration<double, std::ratio<3600>>>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 
-    // 1. Update model (pass strings, model will handle ensuring words/ids)
-    tmodel->update_proficiency(words, feedback_level / 2.0f, now_h);
-    if (!tmodel->get_model_path().empty()) {
-        tmodel->save_fast(tmodel->get_model_path());
-    }
+    tmodel->update_proficiency(word_ids, feedback_level / 2.0f, now_h);
+    tmodel->save_fast(tmodel->get_model_path());
 
-    // 2. Remove answered item
     int old_grp = iid_to_group.at(iid);
-    _active_heap_sizes[old_grp]--; 
+    _active_heap_sizes[old_grp]--;
     
     active_iids.erase(iid);
     iid_to_group.erase(iid);
-    item_words.erase(iid);
+    item_word_ids.erase(iid);
     
-    // Find dependents based on the words that were just updated
+    for (uint32_t wid : word_ids) {
+        if (word_id_to_iids.count(wid)) {
+            auto& vec = word_id_to_iids.at(wid);
+            vec.erase(std::remove(vec.begin(), vec.end(), iid), vec.end());
+            if (vec.empty()) word_id_to_iids.erase(wid);
+        }
+    }
+
     std::unordered_set<int> dependents;
-    for (const auto& w : words) {
-        // The word is now guaranteed to be in the model due to update_proficiency
-        uint32_t wid = tmodel->get_idx().get_id(w);
+    for (uint32_t wid : word_ids) {
         if (word_id_to_iids.count(wid)) {
             for (int dep_iid : word_id_to_iids.at(wid)) {
                 dependents.insert(dep_iid);
             }
-            // Clean up the processed word's entry in the inverted index
-            word_id_to_iids.at(wid).erase(
-                std::remove(word_id_to_iids.at(wid).begin(), word_id_to_iids.at(wid).end(), iid),
-                word_id_to_iids.at(wid).end()
-            );
         }
     }
-
     _rescore_items(dependents, now_h);
 }
 
@@ -135,8 +138,8 @@ void LearningQueue::_rescore_items(const std::unordered_set<int>& iids_to_rescor
 
         int old_grp = iid_to_group.at(iid);
         
-        const auto& words = item_words.at(iid);
-        auto [new_grp, new_key] = _score_and_group(iid, words, now_h);
+        const auto& word_ids = item_word_ids.at(iid);
+        auto [new_grp, new_key] = _score_and_group(iid, word_ids, now_h);
         
         _add_to_heap(iid, new_grp, new_key);
 
@@ -154,53 +157,28 @@ size_t LearningQueue::size(int grp) const {
     return std::accumulate(_active_heap_sizes.begin(), _active_heap_sizes.end(), 0);
 }
 
-// CHANGED: Operates on vector of strings, calls the updated llmodel function
-std::pair<int, float> LearningQueue::_score_and_group(int iid, const std::vector<std::string>& words, double now_h) {
-    
-    auto [grp, effs] = predict_answer_for_queue(*tmodel, words, _words_map_v, _words_map_i, _sent_map, iid);
-
-    float key;
-    if (grp == 0) {
-        key = calculate_unknownness(effs);
-    } else if (grp == 2) {
-        key = tmodel->predict_understanding(words, now_h);
-    } else { // grp == 1
-        key = _promotion_potential(words, effs, now_h);
-    }
-
-    return {grp, key};
-}
-
-// NEW & CORRECTED LOGIC
-float LearningQueue::_promotion_potential(const std::vector<std::string>& words, const std::vector<float>& eff_prof, double now_h) {
-    float pot = 0.0;
-
-    // Deduplicate words for this calculation
-    std::set<std::string> unique_words(words.begin(), words.end());
-
-    for (const auto& w : unique_words) {
-        if (_words_map_v.count(w) && _words_map_i.count(w)) {
-            float s = 0.0;
-            for (int iid_val : _words_map_i.at(w)) {
+float LearningQueue::_promotion_potential(const std::vector<uint32_t>& word_ids, const std::vector<float>& eff_prof, double now_h) {
+    float pot = 0.0f;
+    for (uint32_t wid : word_ids) {
+        if (_words_map_v.count(wid) && _words_map_i.count(wid)) {
+            float s = 0.0f;
+            for (int iid_val : _words_map_i.at(wid)) {
                 if (_sent_map.count(iid_val)) {
                     s += _sent_map.at(iid_val);
                 }
             }
-            pot += s / std::max(1, _words_map_v.at(w));
+            pot += s / std::max(1, _words_map_v.at(wid));
         }
     }
 
-    if (pot == 0.0) {
-        // Fallback: calculate a positive score based on proficiency
-        float pred = tmodel->predict_understanding(words, now_h);
-        float total = 0.0;
+    if (pot == 0.0f) {
+        float pred = tmodel->_predict_understanding_by_id(word_ids, now_h);
+        float total = 0.0f;
         for (float val : eff_prof) {
             total += (val > pred) ? val : pred;
         }
-        return total / std::max(1.0f, (float)words.size());
+        return total / std::max(1.0f, (float)word_ids.size());
     }
-
-    // Main path: return a negative value so higher potential = lower key
     return -pot;
 }
 
