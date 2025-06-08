@@ -56,7 +56,7 @@ class LanguageLearningModel:
     # ---------- disk I/O ----------
 
     def get_model_path(self, language):  # noqa
-        return f"data/vocab_models/{language.lower()}_vocab_model.bin"
+        return Path("data/vocab_models") / f"{language.lower()}_vocab_model.bin"
 
     def load_models(self):
         vocab_dir = Path("data/vocab_models")
@@ -64,7 +64,9 @@ class LanguageLearningModel:
             for f in vocab_dir.glob("*_vocab_model.bin"):
                 try:
                     lang = f.stem.split("_")[0]
-                    self.vocab_models[lang] = VocabularyModel.load_fast(str(f))
+                    model = VocabularyModel.load_fast(str(f))
+                    model.save_fast(str(f)) # This sets the internal path
+                    self.vocab_models[lang] = model
                     st.success(f"Loaded vocabulary model for {lang}")
                 except Exception as e:
                     st.warning(f"Error loading model {f}: {e}")
@@ -85,8 +87,9 @@ class LanguageLearningModel:
     def save_model(self, language):
         key = language.lower()
         if key in self.vocab_models:
-            self.vocab_models[key].save_fast(str(self.get_model_path(key)))
-
+            path = self.get_model_path(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.vocab_models[key].save_fast(str(path))
     # ---------- high-level update / stats ----------
 
     def update_knowledge(self, words, language, feedback_level):
@@ -215,11 +218,10 @@ Total vocabulary: {stats['total_words']} words\n
 {f"Volatile: {stats['volatile']} words"}\n
 {proficiency_stats}""")
 
-def _commit_queue(level, current_item, current_iid, lang):
-    stem = current_item["filename"]
-    idx = current_item["index"]
-    
+def _commit_queue(level, item_info, current_iid, lang):
     st.session_state.learning_queue_obj.process_answer(current_iid, level)
+    stem = item_info["filename"]
+    idx = item_info["index"]
     
     revealed, visible, reviewed, target = load_log_file(lang, stem)
     revealed.add(idx)
@@ -233,18 +235,29 @@ def _commit_queue(level, current_item, current_iid, lang):
 # -------------------------------------------------------------------
 #  QUEUE VIEW 
 # -------------------------------------------------------------------
-def queue_view(model, lang):
+def queue_view(model_service, lang):
     st.subheader("Study Queue")
-    display_vocabulary_stats(model, lang)
+    display_vocabulary_stats(model_service, lang)
 
     # (re)build queue if missing or language changed
     if "learning_queue_obj" not in st.session_state or st.session_state.learning_queue_target != lang:
-        q = LearningQueue(model, lang)
+        # Get the specific model instance for the language
+        model_instance = model_service.get_or_create_model(lang)
+        
+        # Create the queue and pass the model instance to it
+        q = LearningQueue(model_instance)
+        
         all_items = scan_input(lang.lower())
+        
+        # Build an iid -> item map for Python-side lookups
+        iid_map = {item["index"]: item for item in all_items}
+
         q.build_from_input(all_items)
+        
         st.session_state.update({
             "learning_queue_obj": q,
             "learning_queue_target": lang,
+            "iid_to_item_map": iid_map, # Store the map
         })
 
     queue: LearningQueue = st.session_state.learning_queue_obj
@@ -264,10 +277,16 @@ def queue_view(model, lang):
     st.info(f'Queue contains {total} items. \n\n"Didn\'t understand" ({q0_size}), "Partially understood" ({q1_size}), "Fully understood" ({q2_size}).')
 
     group = 2 if q2_size else (1 if q1_size else 0)
-    current_item, current_iid = queue.peek_next(group)
-    if current_item is None:
-        st.warning("No valid item found.")
+    current_iid, group = queue.pop_next()
+    if current_iid is None:
+        st.warning("Queue is empty or contains only invalid items.")
         return
+    
+    current_item = st.session_state.iid_to_item_map.get(current_iid)
+    if not current_item:
+        st.error(f"Could not find item for iid {current_iid}. Rebuilding might be necessary.")
+        return
+
     unit = current_item["unit"]
 
     if "queue_source_revealed" not in st.session_state:
