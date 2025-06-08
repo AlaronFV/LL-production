@@ -1,6 +1,5 @@
 #include "cpp_headers/vocab_model.h"
 #include <cmath>
-#include <numeric>
 #include <algorithm>
 #include <fstream>
 #include <stdexcept>
@@ -55,8 +54,8 @@ VocabularyModel::VocabularyModel(
     float learning_rate, float base_decay_rate, float context_influence, 
     float activation_threshold, float proficiency_min, float proficiency_max,
     double min_elapsed_h, float propagation_threshold, float trace_delete_threshold)
-    : learning_rate(learning_rate), base_decay_rate(base_decay_rate), 
-      context_influence(context_influence), activation_threshold(activation_threshold),
+    : learning_rate(learning_rate), context_influence(context_influence), 
+      activation_threshold(activation_threshold), base_decay_rate(base_decay_rate),
       proficiency_min(proficiency_min), proficiency_max(proficiency_max),
       min_elapsed_h(min_elapsed_h), propagation_threshold(propagation_threshold),
       trace_delete_threshold(trace_delete_threshold) {
