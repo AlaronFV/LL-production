@@ -1,59 +1,56 @@
 #include "cpp_headers/llmodel.h"
+#include "cpp_headers/vocab_model.h"
 #include <numeric>
-#include <algorithm>
+#include <set>
 
 namespace i_plus_one {
 
 std::tuple<int, std::vector<float>> predict_answer_for_queue(
     VocabularyModel& model,
-    const std::vector<std::string>& words_py,
-    std::unordered_map<std::string, int>& words_map_v,
-    std::unordered_map<std::string, std::unordered_set<int>>& words_map_i,
+    const std::vector<uint32_t>& word_ids,
+    std::unordered_map<uint32_t, int>& words_map_v,
+    std::unordered_map<uint32_t, std::unordered_set<int>>& words_map_i,
     std::unordered_map<int, float>& sent_map,
     int iid) {
-    
-    // Deduplicate words while preserving order
-    std::vector<std::string> words;
-    std::set<std::string> seen;
-    for(const auto& w : words_py) {
-        if(seen.find(w) == seen.end()) {
-            seen.insert(w);
-            words.push_back(w);
-        }
+
+    std::set<uint32_t> unique_ids_set(word_ids.begin(), word_ids.end());
+    std::vector<uint32_t> unique_word_ids(unique_ids_set.begin(), unique_ids_set.end());
+
+    size_t n = unique_word_ids.size();
+    if (n == 0) {
+        return std::make_tuple(2, std::vector<float>{});
     }
 
-    size_t n = words.size();
     float thr = 0.3f;
     size_t half = n / 2;
 
-    std::vector<float> effs = model.get_effective_proficiency(words);
+    std::vector<float> effs = model.get_effective_proficiency_by_id(unique_word_ids);
     
-    std::vector<int> unknown_idx;
+    std::vector<uint32_t> unknown_word_ids;
     for(size_t i = 0; i < n; ++i) {
         if (effs[i] <= thr) {
-            unknown_idx.push_back(i);
+            unknown_word_ids.push_back(unique_word_ids[i]);
         }
     }
 
-    size_t unknown_cnt = unknown_idx.size();
+    size_t unknown_cnt = unknown_word_ids.size();
     size_t familiar = n - unknown_cnt;
 
     if (unknown_cnt > half) {
         float diff = static_cast<float>(unknown_cnt - half);
-        sent_map[iid] = words_py.size() / diff;
+        sent_map[iid] = word_ids.size() / diff;
 
-        for (int i : unknown_idx) {
-            const std::string& w = words[i];
-            if (words_map_v.find(w) == words_map_v.end()) {
+        for (uint32_t wid : unknown_word_ids) {
+            if (words_map_v.find(wid) == words_map_v.end()) {
                 float b = 0.1f, v = 0.9f;
-                if (model.get_idx().has_word(w)) {
-                    uint32_t wid = model.get_idx().get_id(w);
+                // Check if the word is processed to get real values
+                if (model.get_processed_word_ids().count(wid)) {
                     b = model.get_prof()[wid];
                     v = model.get_vol()[wid];
                 }
-                words_map_v[w] = promotion_times(b, v);
+                words_map_v[wid] = promotion_times(b, v);
             }
-            words_map_i[w].insert(iid);
+            words_map_i[wid].insert(iid);
         }
     }
 
@@ -67,15 +64,16 @@ std::tuple<int, std::vector<float>> predict_answer_for_queue(
 
 int predict_answer_for_natural_candidates(
     VocabularyModel& model,
-    const std::vector<std::string>& words_py) {
+    const std::vector<uint32_t>& word_ids) {
 
-    size_t n = words_py.size();
-    if (n == 0) return 2; // Empty is fully known
+    size_t n = word_ids.size();
+    if (n == 0) return 2;
+    
     float thr = 0.3f;
     size_t half = n / 2;
     size_t familiar = 0;
 
-    std::vector<float> effs = model.get_effective_proficiency(words_py);
+    std::vector<float> effs = model.get_effective_proficiency_by_id(word_ids);
     for (float eff : effs) {
         if (eff > thr) {
             familiar++;
@@ -93,18 +91,31 @@ std::set<int> get_natural_candidates(
     const std::set<int>& current_indices) {
     
     std::set<int> natural;
-    for (size_t i = 0; i < py::len(aligned_text_py); ++i) {
+    py::gil_scoped_acquire acquire;
+
+    for (const auto& item_handle : aligned_text_py) {
+        py::dict unit_dict = item_handle.cast<py::dict>();
+        // Assuming the structure from main.py is {"filename":..., "index":..., "unit":...}
+        // and aligned_text is a list of these full records.
+        int i = unit_dict["index"].cast<int>();
+
         if (current_indices.count(i)) continue;
 
-        py::dict unit = aligned_text_py[i].cast<py::dict>();
-        if (!unit.contains("words")) continue;
+        py::dict unit = unit_dict["unit"].cast<py::dict>();
+        py::list words_py = unit["words"].cast<py::list>();
+        if (words_py.empty()) continue;
 
-        std::vector<std::string> words = unit["words"].cast<std::vector<std::string>>();
-        if (words.empty()) continue;
-        
-        int ans = predict_answer_for_natural_candidates(model, words);
+        std::vector<std::string> words_str = words_py.cast<std::vector<std::string>>();
+        std::vector<uint32_t> word_ids;
+        word_ids.reserve(words_str.size());
+        for(const auto& w : words_str) {
+            // Here we must add the word to the index if it's not present
+            word_ids.push_back(model.get_idx().get_id(w));
+        }
 
-        if (ans >= 1 || words.size() < 5) {
+        int ans = predict_answer_for_natural_candidates(model, word_ids);
+
+        if (ans >= 1 || words_str.size() < 5) {
             natural.insert(i);
         }
     }
@@ -112,6 +123,7 @@ std::set<int> get_natural_candidates(
 }
 
 float calculate_unknownness(const std::vector<float>& effs) {
+    if (effs.empty()) return 0.0f;
     double s = std::accumulate(effs.begin(), effs.end(), 0.0);
     return effs.size() - s;
 }
@@ -121,45 +133,57 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
     const auto& eff_prof = model.get_eff_prof();
     const auto& prof = model.get_prof();
     const auto& vol = model.get_vol();
+    const auto& processed_ids = model.get_processed_word_ids();
     float prof_min = model.get_proficiency_min();
-    size_t total = model.get_idx().size();
+    
+    stats["total_words"] = model.get_idx().size();
+    stats["processed_words"] = processed_ids.size();
 
-    stats["total_words"] = total;
-    stats["all_possible_knowledge"] = total * 0.97;
-    
-    stats["all_known_knowledge"] = std::accumulate(eff_prof.begin(), eff_prof.end(), 0.0);
-    
-    stats["well_known"] = std::count_if(eff_prof.begin(), eff_prof.end(), [](float v){ return v > 0.7f; });
-    stats["familiar"] = std::count_if(eff_prof.begin(), eff_prof.end(), [](float v){ return v >= 0.3f && v <= 0.7f; });
-    stats["learning"] = std::count_if(eff_prof.begin(), eff_prof.end(), [](float v){ return v < 0.3f && v > 0; });
-    
-    stats["stable"] = std::count_if(vol.begin(), vol.end(), [](float v){ return v < 0.3f; });
-    stats["semi_stable"] = std::count_if(vol.begin(), vol.end(), [](float v){ return v >= 0.3f && v <= 0.6f; });
-    stats["volatile"] = 0;
-    for(size_t i=0; i<total; ++i) {
-        if (vol[i] > 0.6f && eff_prof[i] > 0) {
-            stats["volatile"]++;
+    double all_known_knowledge = 0;
+    double avg_eff_prof_sum = 0;
+    double avg_prof_sum = 0;
+    double avg_vol_sum = 0;
+    size_t well_known_count = 0;
+    size_t familiar_count = 0;
+    size_t learning_count = 0;
+    size_t stable_count = 0;
+    size_t semi_stable_count = 0;
+    size_t volatile_count = 0;
+
+    for (uint32_t wid : processed_ids) {
+        float ep = eff_prof[wid];
+        float p = prof[wid];
+        float v = vol[wid];
+
+        all_known_knowledge += ep;
+        avg_eff_prof_sum += ep;
+
+        if (ep > 0.7f) well_known_count++;
+        else if (ep >= 0.3f) familiar_count++;
+        else learning_count++;
+
+        if (v < 0.3f) stable_count++;
+        else if (v <= 0.6f) semi_stable_count++;
+        else volatile_count++;
+        
+        if (p > prof_min) {
+            avg_prof_sum += p;
+            avg_vol_sum += v;
         }
     }
 
-    double eff_prof_sum = 0, prof_sum = 0, vol_sum = 0;
-    int eff_prof_count = 0, prof_count = 0;
+    stats["all_known_knowledge"] = all_known_knowledge;
+    stats["well_known"] = well_known_count;
+    stats["familiar"] = familiar_count;
+    stats["learning"] = learning_count;
+    stats["stable"] = stable_count;
+    stats["semi_stable"] = semi_stable_count;
+    stats["volatile"] = volatile_count;
 
-    for(size_t i=0; i<total; ++i) {
-        if (eff_prof[i] > 0) {
-            eff_prof_sum += eff_prof[i];
-            eff_prof_count++;
-        }
-        if (prof[i] > prof_min) {
-            prof_sum += prof[i];
-            vol_sum += vol[i];
-            prof_count++;
-        }
-    }
-
-    stats["average_effective_proficiency"] = (eff_prof_count > 0) ? (eff_prof_sum / eff_prof_count) : 0.0;
-    stats["average_proficiency"] = (prof_count > 0) ? (prof_sum / prof_count) : 0.0;
-    stats["average_volatility"] = (prof_count > 0) ? (vol_sum / prof_count) : 0.0;
+    size_t processed_count = processed_ids.size();
+    stats["average_effective_proficiency"] = (processed_count > 0) ? (avg_eff_prof_sum / processed_count) : 0.0;
+    stats["average_proficiency"] = (processed_count > 0) ? (avg_prof_sum / processed_count) : 0.0;
+    stats["average_volatility"] = (processed_count > 0) ? (avg_vol_sum / processed_count) : 0.0;
 
     return stats;
 }

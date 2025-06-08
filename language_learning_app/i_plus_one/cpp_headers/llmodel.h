@@ -17,15 +17,15 @@ class VocabularyModel;
 
 std::tuple<int, std::vector<float>> predict_answer_for_queue(
     VocabularyModel& model,
-    const std::vector<std::string>& words,
-    std::unordered_map<std::string, int>& words_map_v,
-    std::unordered_map<std::string, std::unordered_set<int>>& words_map_i,
+    const std::vector<uint32_t>& word_ids,
+    std::unordered_map<uint32_t, int>& words_map_v,
+    std::unordered_map<uint32_t, std::unordered_set<int>>& words_map_i,
     std::unordered_map<int, float>& sent_map,
     int iid);
-    
+
 int predict_answer_for_natural_candidates(
     VocabularyModel& model,
-    const std::vector<std::string>& words);
+    const std::vector<uint32_t>& word_ids);
 
 std::set<int> get_natural_candidates(
     VocabularyModel& model,
