@@ -87,23 +87,19 @@ int predict_answer_for_natural_candidates(
 
 std::set<int> get_natural_candidates(
     VocabularyModel& model,
-    const py::list& aligned_text_py,
+    const py::list& aligned_text_words_py,
     const std::set<int>& current_indices) {
     
     std::set<int> natural;
     py::gil_scoped_acquire acquire;
+    int i = 0;
 
-    for (const auto& item_handle : aligned_text_py) {
-        py::dict unit_dict = item_handle.cast<py::dict>();
-        // Assuming the structure from main.py is {"filename":..., "index":..., "unit":...}
-        // and aligned_text is a list of these full records.
-        int i = unit_dict["index"].cast<int>();
-
-        if (current_indices.count(i)) continue;
-
-        py::dict unit = unit_dict["unit"].cast<py::dict>();
-        py::list words_py = unit["words"].cast<py::list>();
-        if (words_py.empty()) continue;
+    for (const auto& item_handle : aligned_text_words_py) {
+        py::list words_py = item_handle.cast<py::list>();
+        if (words_py.empty() || current_indices.count(i)) {
+            i++; 
+            continue;
+        }
 
         std::vector<std::string> words_str = words_py.cast<std::vector<std::string>>();
         std::vector<uint32_t> word_ids;
@@ -118,6 +114,7 @@ std::set<int> get_natural_candidates(
         if (ans >= 1 || words_str.size() < 5) {
             natural.insert(i);
         }
+        i++;
     }
     return natural;
 }

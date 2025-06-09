@@ -476,11 +476,19 @@ def main():
     # ----------------------------------------------------------------
     
     if "aligned_text" not in st.session_state:
-        st.session_state.aligned_text = [
-            orjson.loads(line)["unit"]
+        
+        text = [
+            (orjson.loads(line)["unit"], orjson.loads(line)["index"])
             for line in input_nd.read_bytes().splitlines()
             if orjson.loads(line)["filename"] == selected_stem
         ]
+        aligned_text = [u[0] for u in sorted(text, key=lambda x: x[1])]
+        aligned_text_only_words = [u["words"] for u in aligned_text]
+        st.session_state.update({
+            "aligned_text": aligned_text,
+            "aligned_text_only_words": aligned_text_only_words,
+        })
+        
     total_units = len(st.session_state.aligned_text)
 
     # load existing log‐state via our new SQLite loader:
@@ -495,7 +503,7 @@ def main():
     
     if "to_replace_indices" not in st.session_state:
         natural = get_natural_candidates(
-            st.session_state.aligned_text, st.session_state.target_idx, model.get_or_create_model(target_language)
+            model.get_or_create_model(target_language), st.session_state.aligned_text_only_words, st.session_state.target_idx
         )
         st.session_state.to_replace_indices = st.session_state.target_idx.union(natural)
     
@@ -509,9 +517,9 @@ def main():
         st.session_state.update({
             "potential_natural": len(
                 get_natural_candidates(
-                    st.session_state.aligned_text,
-                    st.session_state.to_replace_indices,
                     model.get_or_create_model(target_language),
+                    st.session_state.aligned_text_only_words,
+                    st.session_state.to_replace_indices,
                 )
             ),
             "potential_natural_recount": False,
@@ -561,9 +569,9 @@ def main():
     with col1:
         if st.button("Update Target Sentences"):
             naturals = get_natural_candidates(
-                st.session_state.aligned_text,
-                st.session_state.to_replace_indices,
                 model.get_or_create_model(target_language),
+                st.session_state.aligned_text_only_words,
+                st.session_state.to_replace_indices,
             )
             st.session_state.to_replace_indices.update(naturals)
             st.session_state.potential_natural_recount = True
@@ -675,7 +683,7 @@ def main():
         mark = 0
         for i in st.session_state.to_replace_indices:
             if i not in st.session_state.revealed:
-                model.update_knowledge(st.session_state.aligned_text[i]["words"], target_language, 3)
+                model.update_knowledge(st.session_state.aligned_text_only_words[i], target_language, 3)
                 st.session_state.revealed.add(i)
                 st.session_state.reviewed.add(i)
                 st.session_state.visible[i] = False

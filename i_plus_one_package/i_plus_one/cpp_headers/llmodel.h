@@ -29,7 +29,7 @@ int predict_answer_for_natural_candidates(
 
 std::set<int> get_natural_candidates(
     VocabularyModel& model,
-    const py::list& aligned_text_py,
+    const py::list& aligned_text_words_py,
     const std::set<int>& current_indices);
 
 float calculate_unknownness(const std::vector<float>& effs);
