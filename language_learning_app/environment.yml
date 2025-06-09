@@ -7,7 +7,6 @@ dependencies:
   - python=3.12
   - numpy>=1.20 # Still a runtime dependency
   - streamlit=1.45.1
-  - heapdict
   - spacy
   - regex
   - orjson
