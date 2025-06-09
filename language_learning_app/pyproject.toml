@@ -3,7 +3,7 @@
 requires = [
   "setuptools>=80.0",
   "wheel",
-  "Cython>=0.29",     # needed to compile your .pyx
+  "pybind11",
   "numpy>=1.20"       # needed for numpy.get_include()
 ]
 build-backend = "setuptools.build_meta"
@@ -19,12 +19,13 @@ dependencies = ["numpy>=1.20"]
 # tell setuptools to find your packages
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cy_utils"]
+include = ["i_plus_one"]
 
 [tool.cibuildwheel]
+# Build only for Python 3.12
 build = "cp312-*"
-archs = ["auto"]
 
-# Linux-specific configuration
+# Linux aarch64 build
 [tool.cibuildwheel.linux]
+build = "cp312-manylinux_2_28*"
 archs = ["aarch64"]

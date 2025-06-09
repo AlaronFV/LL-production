@@ -14,7 +14,7 @@ import sqlite3
 # -------------------------------------------------------------------
 # import underlying vocabulary model
 # -------------------------------------------------------------------
-from cy_utils import (
+from i_plus_one import (
     VocabularyModel,
     LearningQueue,
     get_natural_candidates,
