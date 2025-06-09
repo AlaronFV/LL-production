@@ -40,8 +40,8 @@ PYBIND11_MODULE(i_plus_one_cpp, m) {
         }, "Get vocabulary statistics", py::arg("model"));
         
     m.def("get_natural_candidates", 
-        [](std::shared_ptr<VocabularyModel> model, const py::list& aligned_text, const std::set<int>& current_indices) {
-            return get_natural_candidates(*model, aligned_text, current_indices);
+        [](std::shared_ptr<VocabularyModel> model, const py::list& aligned_text_words_py, const std::set<int>& current_indices) {
+            return get_natural_candidates(*model, aligned_text_words_py, current_indices);
         }, "Get natural sentence candidates",
-        py::arg("model"), py::arg("aligned_text"), py::arg("current_indices"));
+        py::arg("model"), py::arg("aligned_text_words_py"), py::arg("current_indices"));
 }

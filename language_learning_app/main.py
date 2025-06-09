@@ -197,18 +197,17 @@ def scan_input(lang: str):
 # -------------------------------------------------------------------
 def display_vocabulary_stats(model, target_language):
     stats = get_vocabulary_statistics(model.get_or_create_model(target_language))
-    if stats["total_words"] > 0:
-        knowledge_stats = f"""Current knowledge: {stats['all_known_knowledge']:.2f}\n
+    knowledge_stats = f"""Current knowledge: {stats['all_known_knowledge']:.2f}\n
 Learning potential: {stats['all_possible_knowledge'] - stats['all_known_knowledge']:.2f}\n
 All knowledge: {stats['all_possible_knowledge']:.2f}"""
-        proficiency_stats = f"""Avg proficiency: {stats['average_proficiency']:.2f}\n
+    proficiency_stats = f"""Avg proficiency: {stats['average_proficiency']:.2f}\n
 Avg volatility: {stats['average_volatility']:.2f}\n
 Avg effective: {stats['average_effective_proficiency']:.2f}"""
-    else:
-        knowledge_stats, proficiency_stats = "", ""
     st.sidebar.write(f"""### {f"Vocabulary Statistics: {target_language}"}\n
-Total vocabulary: {stats['total_words']} words\n
+Seen vocabulary: {stats['total_seen_words']} words\n
+Tracked vocabulary: {stats['processed_words']} words\n
 {knowledge_stats}\n
+{f"Well known: {stats['well_known']} words"}\n
 {f"Familiar: {stats['familiar']} words"}\n
 {f"Still learning: {stats['learning']} words"}\n
 {f"Stable knowledge: {stats['stable']} words"}\n

@@ -101,17 +101,15 @@ std::set<int> get_natural_candidates(
             continue;
         }
 
-        std::vector<std::string> words_str = words_py.cast<std::vector<std::string>>();
         std::vector<uint32_t> word_ids;
-        word_ids.reserve(words_str.size());
-        for(const auto& w : words_str) {
-            // Here we must add the word to the index if it's not present
-            word_ids.push_back(model.get_idx().get_id(w));
+        word_ids.reserve(words_py.size());
+        for(const auto& w : words_py) {
+            word_ids.push_back(model.get_idx().get_id(w.cast<std::string>()));
         }
 
         int ans = predict_answer_for_natural_candidates(model, word_ids);
 
-        if (ans >= 1 || words_str.size() < 5) {
+        if (ans >= 1 || word_ids.size() < 5) {
             natural.insert(i);
         }
         i++;
@@ -131,13 +129,13 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
     const auto& prof = model.get_prof();
     const auto& vol = model.get_vol();
     const auto& processed_ids = model.get_processed_word_ids();
-    float prof_min = model.get_proficiency_min();
     
-    stats["total_words"] = model.get_idx().size();
-    stats["processed_words"] = processed_ids.size();
+    size_t processed_count = processed_ids.size();
+    stats["total_seen_words"] = model.get_idx().size();
+    stats["processed_words"] = processed_count;
+    stats["all_possible_knowledge"] = processed_count * 0.97;
 
     double all_known_knowledge = 0;
-    double avg_eff_prof_sum = 0;
     double avg_prof_sum = 0;
     double avg_vol_sum = 0;
     size_t well_known_count = 0;
@@ -153,7 +151,8 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
         float v = vol[wid];
 
         all_known_knowledge += ep;
-        avg_eff_prof_sum += ep;
+        avg_prof_sum += p;
+        avg_vol_sum += v;
 
         if (ep > 0.7f) well_known_count++;
         else if (ep >= 0.3f) familiar_count++;
@@ -162,11 +161,6 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
         if (v < 0.3f) stable_count++;
         else if (v <= 0.6f) semi_stable_count++;
         else volatile_count++;
-        
-        if (p > prof_min) {
-            avg_prof_sum += p;
-            avg_vol_sum += v;
-        }
     }
 
     stats["all_known_knowledge"] = all_known_knowledge;
@@ -177,8 +171,7 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
     stats["semi_stable"] = semi_stable_count;
     stats["volatile"] = volatile_count;
 
-    size_t processed_count = processed_ids.size();
-    stats["average_effective_proficiency"] = (processed_count > 0) ? (avg_eff_prof_sum / processed_count) : 0.0;
+    stats["average_effective_proficiency"] = (processed_count > 0) ? (all_known_knowledge / processed_count) : 0.0;
     stats["average_proficiency"] = (processed_count > 0) ? (avg_prof_sum / processed_count) : 0.0;
     stats["average_volatility"] = (processed_count > 0) ? (avg_vol_sum / processed_count) : 0.0;
 

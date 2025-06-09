@@ -64,7 +64,6 @@ public:
     const std::vector<float>& get_vol() const { return vol; }
     const std::vector<float>& get_eff_prof() const { return eff_prof; }
     const std::unordered_set<uint32_t>& get_processed_word_ids() const { return _processed_word_ids; }
-    float get_proficiency_min() const { return proficiency_min; }
 
 private:
     friend class LearningQueue;
