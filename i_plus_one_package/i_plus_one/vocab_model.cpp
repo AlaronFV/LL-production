@@ -6,6 +6,7 @@
 #include <iostream>
 #include <deque>
 #include <chrono>
+#include <unordered_set>
 
 namespace i_plus_one {
 
@@ -14,24 +15,21 @@ const char MAGIC_STRING[] = "IP1MDL";
 const uint32_t MODEL_VERSION = 2; // Version incremented for new format
 
 // --- Helper Functions ---
-size_t intersection_size_vec_vec(const std::vector<uint32_t>& vec1, const std::vector<uint32_t>& vec2) {
-    size_t count = 0;
-    auto it1 = vec1.begin();
-    auto it2 = vec2.begin();
-    while (it1 != vec1.end() && it2 != vec2.end()) {
-        if (*it1 < *it2) ++it1;
-        else if (*it2 < *it1) ++it2;
-        else { count++; ++it1; ++it2; }
-    }
-    return count;
+[[nodiscard]] size_t intersection_size_vec_vec(const std::vector<uint32_t>& vec1, const std::vector<uint32_t>& vec2) {
+    std::vector<uint32_t> intersection;
+    std::set_intersection(
+        vec1.begin(), vec1.end(),
+        vec2.begin(), vec2.end(),
+        std::back_inserter(intersection)
+    );
+    return intersection.size();
 }
 
-size_t intersection_size_set_vec(const std::set<uint32_t>& py_set, const std::vector<uint32_t>& cpp_vec) {
-    size_t count = 0;
-    for (uint32_t val : cpp_vec) {
-        if (py_set.count(val)) count++;
-    }
-    return count;
+[[nodiscard]] size_t intersection_size_set_vec(const std::unordered_set<uint32_t>& py_set, const std::vector<uint32_t>& cpp_vec) {
+    return std::count_if(cpp_vec.begin(), cpp_vec.end(),
+        [&py_set](uint32_t val) { 
+            return py_set.find(val) != py_set.end(); 
+        });
 }
 
 // --- WordIndex Implementation ---
@@ -78,9 +76,10 @@ uint32_t VocabularyModel::_get_or_create_processed_id(uint32_t global_id, double
     _processed_to_global_id.push_back(global_id);
 
     // Expand the core vectors by one for the new word
-    prof.push_back(0.0f);
-    vol.push_back(0.0f); // Or some initial value
-    eff_prof.push_back(0.0f);
+    float new_prof = 0.5f + _get_word_activation(global_id, now_h) * 0.1f;
+    prof.push_back(new_prof);
+    vol.push_back(0.9f);
+    eff_prof.push_back(_eff_prof_formula(new_prof, 0.9f));
     encounters.push_back(0);
     _word_last_decay_h.push_back(now_h); // Initialize last decay time
 
@@ -111,19 +110,20 @@ void VocabularyModel::update_proficiency(const std::vector<uint32_t>& global_wor
 
     // This is now the ONLY place where words become "processed"
     std::set<uint32_t> unique_global_ids(global_word_ids.begin(), global_word_ids.end());
+
+    int new_trace_idx = _add_trace(unique_global_ids, now_h, 1.0f, (0.1f - 0.05f * u_val));
+    _propagate(new_trace_idx);
+    _prune_traces();
+
+    float expected = _predict_understanding_by_id(global_word_ids, now_h);
+
     std::vector<uint32_t> processed_ids;
     processed_ids.reserve(unique_global_ids.size());
 
     for (uint32_t global_id : unique_global_ids) {
         processed_ids.push_back(_get_or_create_processed_id(global_id, now_h));
     }
-
-    float expected = _predict_understanding_by_id(global_word_ids, now_h);
     
-    int new_trace_idx = _add_trace(unique_global_ids, now_h, 1.0f, (0.1f - 0.05f * u_val));
-    _propagate(new_trace_idx);
-    _prune_traces();
-
     float err = u_val - expected;
     
     // CHANGED: Loop over the dense processed_ids for direct array access
@@ -192,7 +192,7 @@ float VocabularyModel::_predict_understanding_by_id(const std::vector<uint32_t>&
     _process_due_trace_decays(current_time_h);
 
     float sum_p = 0.0f, min_p = 1.0f;
-    std::set<uint32_t> non_zero_global_ids;
+    std::unordered_set<uint32_t> non_zero_global_ids;
     
     for (uint32_t global_id : global_word_ids) {
         float ep;
@@ -336,7 +336,7 @@ void VocabularyModel::_propagate(int source_trace_idx) {
     if (source_trace_idx < 0 || static_cast<size_t>(source_trace_idx) >= _trace_activations.size()) return;
     std::deque<std::pair<int, float>> queue;
     queue.push_back({source_trace_idx, _trace_activations[source_trace_idx]});
-    std::unordered_map<int, bool> visited_neighbors;
+    std::unordered_set<int> visited_neighbors;
     while(!queue.empty()){
         auto [current_trace_idx, delta] = queue.front();
         queue.pop_front();
@@ -345,11 +345,11 @@ void VocabularyModel::_propagate(int source_trace_idx) {
         for (uint32_t word_id : current_word_ids) {
             if (word_to_traces.count(word_id)) {
                 for (int neighbor_trace_idx : word_to_traces.at(word_id)) {
-                    if (neighbor_trace_idx != current_trace_idx) visited_neighbors[neighbor_trace_idx] = true;
+                    if (neighbor_trace_idx != current_trace_idx) visited_neighbors.insert(neighbor_trace_idx);
                 }
             }
         }
-        for(auto const& [neighbor_trace_idx, _] : visited_neighbors) {
+        for(int neighbor_trace_idx : visited_neighbors) {
             const auto& neighbor_word_ids = _trace_word_ids[neighbor_trace_idx];
             size_t ov = intersection_size_vec_vec(current_word_ids, neighbor_word_ids);
             if (ov == 0) continue;
@@ -358,8 +358,8 @@ void VocabularyModel::_propagate(int source_trace_idx) {
             if (tj_part < step) {
                 _trace_activations[neighbor_trace_idx] += step - tj_part;
                 _trace_activations[neighbor_trace_idx] = std::min(1.0f, _trace_activations[neighbor_trace_idx]);
-                if (step > propagation_threshold) queue.push_back({neighbor_trace_idx, step});
             }
+            if (step > propagation_threshold) queue.push_back({neighbor_trace_idx, step});
         }
     }
 }
@@ -390,7 +390,7 @@ void VocabularyModel::_prune_traces() {
     }
 }
 
-float VocabularyModel::_calculate_context_support(const std::set<uint32_t>& id_words, size_t n) {
+float VocabularyModel::_calculate_context_support(const std::unordered_set<uint32_t>& id_words, size_t n) {
     if (id_words.empty() || _trace_timestamps_h.empty()) return 0.0f;
     float mx = 0.0f;
     for (size_t trace_idx = 0; trace_idx < _trace_timestamps_h.size(); ++trace_idx) {
