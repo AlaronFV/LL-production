@@ -29,7 +29,7 @@ PYBIND11_MODULE(i_plus_one_cpp, m) {
     py::class_<LearningQueue>(m, "LearningQueue")
         .def(py::init<std::shared_ptr<VocabularyModel>>(), py::arg("model"))
         .def("build_from_input", &LearningQueue::build_from_input, py::arg("items"))
-        .def("pop_next", &LearningQueue::pop_next)
+        .def("peek_next", &LearningQueue::peek_next)
         .def("process_answer", &LearningQueue::process_answer, py::arg("iid"), py::arg("feedback_level"))
         .def("size", &LearningQueue::size, py::arg("grp") = -1);
         
