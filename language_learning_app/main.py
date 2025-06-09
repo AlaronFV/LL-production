@@ -5,8 +5,7 @@
 
 import streamlit as st
 from pathlib import Path
-from collections import defaultdict
-from functools import partial, lru_cache
+from functools import partial
 
 import orjson
 import sqlite3
@@ -22,25 +21,17 @@ from i_plus_one import (
 )
 from preparer import prepare
 
+# --- DATABASE SETUP ---
+DB_PATH = Path("data") / "i_plus_one.db"
 
-# -------------------------------------------------------------------
-# folder bootstrap
-# -------------------------------------------------------------------
-for d in ["input", "data/vocab_models"]:
-    Path(d).mkdir(parents=True, exist_ok=True)
+def get_db_conn():
+    """Creates and returns a database connection."""
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
-# set up SQLite logs DB
-LOG_DB = Path("data") / "logs.db"
-LOG_DB.parent.mkdir(exist_ok=True, parents=True)
-log_conn = sqlite3.connect(str(LOG_DB), check_same_thread=False)
-log_conn.execute("""
-CREATE TABLE IF NOT EXISTS logs (
-    lang TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY(lang, filename)
-)""")
-log_conn.commit()
+# Check if the database exists on startup
+if not DB_PATH.exists():
+    st.error(f"Database not found at '{DB_PATH}'.")
+    st.stop()
 
 # -------------------------------------------------------------------
 #  MULTI-LANGUAGE WRAPPER AROUND VocabularyModel
@@ -126,76 +117,63 @@ class LanguageLearningModel:
 
 
 # -------------------------------------------------------------------
-# LOG-FILE HELPERS 
+#  NEW DATABASE HELPERS
 # -------------------------------------------------------------------
-def load_log_file(lang: str, filename: str):
-    """
-    Returns (revealed:set, visible:dict, reviewed:set, target:set)
-    for this (lang, filename_stem).
-    """
 
-    cur = log_conn.execute(
-        "SELECT payload FROM logs WHERE lang=? AND filename=?", (lang, filename)
-    )
-    row = cur.fetchone()
-    if not row:
-        return set(), {}, set(), set()
-    p = orjson.loads(row[0])
-    return (
-        set(p.get("revealed", [])),
-        {int(k): v for k, v in p.get("visible_states", {}).items()},
-        set(p.get("reviewed", [])),
-        set(p.get("target_indices", [])),
-    )
+@st.cache_data
+def get_available_languages():
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT lang FROM texts ORDER BY lang")
+        return [row[0] for row in cur.fetchall()] or ["latin"]
 
-def save_session_state(lang: str, filename: str, revealed, target, visible, reviewed):
-    """
-    Upsert one record back into logs table.
-    """
-    payload = {
-        "revealed": list(revealed),
-        "target_indices": list(target),
-        "visible_states": {str(k): v for k, v in visible.items()},
-        "reviewed": list(reviewed),
-    }
-    blob = orjson.dumps(payload)
-    log_conn.execute("""
-        INSERT INTO logs(lang, filename, payload)
-        VALUES(?, ?, ?)
-        ON CONFLICT(lang, filename) DO UPDATE SET payload=excluded.payload
-    """, (lang, filename, blob))
-    log_conn.commit()
+@st.cache_data
+def get_files_for_language(language: str):
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT filename FROM texts WHERE lang = ? ORDER BY filename", (language,))
+        return [row[0] for row in cur.fetchall()]
 
-# -------------------------------------------------------------------
-#  INPUT SCAN (one pass)
-# -------------------------------------------------------------------
-def scan_input(lang: str):
-    """
-    Streams input/<lang>/<lang>.ndjson → a list of items
-    {filename, index, unit}.
-    """
-    items = {}
-    only_words = []
-    nd = Path("input") / f"{lang}.ndjson"
-    counter = 0
-    if not nd.exists():
-        st.error(f"No input NDJSON for '{lang}'. Run migrate_data.py")
-        return items
+@st.cache_data
+def get_chapters_for_file(language: str, filename: str):
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        # Sorting chapters numerically if they are digits, otherwise alphabetically
+        cur.execute("SELECT DISTINCT chapter FROM texts WHERE lang = ? AND filename = ? ORDER BY CAST(chapter AS INTEGER), chapter", (language, filename))
+        return [row[0] for row in cur.fetchall()]
 
-    for line in nd.read_bytes().splitlines():
-        rec = orjson.loads(line)
-        stem = rec["filename"]
-        idx = rec["index"]
-        _, _, reviewed, _ = load_log_file(lang, stem)
-        if idx in reviewed or not rec["unit"].get("words"):
-            continue
-        source = rec["unit"]["source"]
-        target = rec["unit"]["target"]
-        words = rec["unit"]["words"]
-        items[counter] = {"filename": stem, "index": idx, "source": source, "target": target}
-        only_words.append(words)
-        counter += 1
-    return items, only_words
+def load_text_and_progress(language: str, filename: str, chapter: str):
+    query = """
+    SELECT t.idx, t.source, t.target, t.words_json,
+           COALESCE(p.is_target, 0) as is_target,
+           COALESCE(p.is_revealed, 0) as is_revealed,
+           COALESCE(p.is_reviewed, 0) as is_reviewed
+    FROM texts t
+    LEFT JOIN user_progress p ON t.lang = p.lang AND t.filename = p.filename AND t.chapter = p.chapter AND t.idx = p.text_idx
+    WHERE t.lang = ? AND t.filename = ? AND t.chapter = ?
+    ORDER BY t.idx
+    """
+    with get_db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(query, (language, filename, chapter))
+        rows = [dict(row) for row in cur.fetchall()]
+        for row in rows:
+            row['words'] = orjson.loads(row['words_json'])
+        return rows
+
+def save_progress_for_sentence(lang, fname, chap, idx, is_target, is_revealed, is_reviewed):
+    query = "INSERT OR REPLACE INTO user_progress VALUES (?, ?, ?, ?, ?, ?, ?)"
+    with get_db_conn() as conn:
+        conn.execute(query, (lang, fname, chap, idx, is_target, is_revealed, is_reviewed))
+        conn.commit()
+
+def save_multiple_as_target(lang, fname, chap, indices):
+    records = [(lang, fname, chap, idx, 1, 0, 0) for idx in indices]
+    query = "INSERT OR IGNORE INTO user_progress (lang, filename, chapter, text_idx, is_target, is_revealed, is_reviewed) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    with get_db_conn() as conn:
+        conn.executemany(query, records)
+        conn.commit()
 
 
 # -------------------------------------------------------------------
@@ -221,54 +199,53 @@ Tracked vocabulary: {stats['processed_words']:.0f} words\n
 {f"Volatile: {stats['volatile']:.0f} words"}\n
 {proficiency_stats}""")
 
-def _commit_queue(level, item_info, current_iid, lang):
-    st.session_state.learning_queue_obj.process_answer(current_iid, level)
-    stem = item_info["filename"]
-    idx = item_info["index"]
-    
-    revealed, visible, reviewed, target = load_log_file(lang, stem)
-    revealed.add(idx)
-    reviewed.add(idx)
-    visible[idx] = False
-    target.add(idx)
-    save_session_state(lang, stem, revealed, target, visible, reviewed)
-
-    st.session_state.queue_source_revealed = False
-    st.rerun()
 # -------------------------------------------------------------------
 #  QUEUE VIEW 
 # -------------------------------------------------------------------
 def queue_view(model_service, lang):
     st.subheader("Study Queue")
 
-    # (re)build queue if missing or language changed
     if "learning_queue_obj" not in st.session_state or st.session_state.learning_queue_target != lang:
-        # Get the specific model instance for the language
-        model_instance = model_service.get_or_create_model(lang)
-        
-        # Create the queue and pass the model instance to it
-        q = LearningQueue(model_instance)
-        
-        all_items, only_words = scan_input(lang.lower())
+        with st.spinner("Building study queue from database..."):
+            # Get all non-reviewed items for the language from the DB
+            query = """
+            SELECT t.filename, t.chapter, t.idx, t.source, t.target, t.words_json
+            FROM texts t
+            LEFT JOIN user_progress p ON t.lang = p.lang AND t.filename = p.filename AND t.chapter = p.chapter AND t.idx = p.text_idx
+            WHERE t.lang = ? AND (p.is_reviewed IS NULL OR p.is_reviewed = 0) AND t.words_json != '[]'
+            """
+            with get_db_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute(query, (lang,))
+                all_item_records = [dict(row) for row in cur.fetchall()]
 
-        q.build_from_input(only_words)
-        
-        st.session_state.update({
-            "learning_queue_obj": q,
-            "learning_queue_target": lang,
-            "iid_to_item_map": all_items, # Store the map
-        })
+            if not all_item_records:
+                st.info("No items to study. All content has been reviewed!")
+                return
+
+            # Prepare data for the LearningQueue
+            only_words = [orjson.loads(rec['words_json']) for rec in all_item_records]
+            # Map internal queue ID (iid) to our database record
+            iid_to_item_map = {i: rec for i, rec in enumerate(all_item_records)}
+
+            model_instance = model_service.get_or_create_model(lang)
+            q = LearningQueue(model_instance)
+            q.build_from_input(only_words)
+            
+            st.session_state.update({
+                "learning_queue_obj": q,
+                "learning_queue_target": lang,
+                "iid_to_item_map": iid_to_item_map,
+                "queue_source_revealed": False,
+            })
     
     display_vocabulary_stats(model_service, lang)
 
     queue: LearningQueue = st.session_state.learning_queue_obj
     total = queue.size()
     if not total:
-        st.info("Queue empty.  Click rebuild if you added new material.")
-        if st.button("Rebuild Queue"):
-            st.cache_data.clear()
-            st.session_state.pop("learning_queue_obj", None)
-            st.rerun()
+        st.info("Queue empty.  Click 'Back to Text' to add new material.")
         return
     
     q0_size = queue.size(0)
@@ -277,7 +254,7 @@ def queue_view(model_service, lang):
 
     st.info(f'Queue contains {total} items. \n\n"Didn\'t understand" ({q0_size}), "Partially understood" ({q1_size}), "Fully understood" ({q2_size}).')
 
-    current_iid = queue.pop_next()
+    current_iid = queue.peek_next()
     if current_iid is None:
         st.warning("Queue is empty or contains only invalid items.")
         return
@@ -287,10 +264,6 @@ def queue_view(model_service, lang):
         st.error(f"Could not find item for iid {current_iid}. Rebuilding might be necessary.")
         return
 
-
-    if "queue_source_revealed" not in st.session_state:
-        st.session_state.queue_source_revealed = False
-
     st.markdown("### Current Unit")
     if st.button(current_item["target"], key="unit_target_btn"):
         st.session_state.queue_source_revealed = True
@@ -298,16 +271,52 @@ def queue_view(model_service, lang):
 
     if st.session_state.queue_source_revealed:
         st.info(current_item["source"])
+        
+        def _commit_queue(level):
+            # Update learning queue
+            st.session_state.learning_queue_obj.process_answer(current_iid, level)
+            
+            # Mark as reviewed in the database
+            save_progress_for_sentence(
+                lang, current_item['filename'], current_item['idx'],
+                is_target=1, is_revealed=1, is_reviewed=1
+            )
+            
+            st.session_state.queue_source_revealed = False
+            st.rerun()
+        
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("❌😔❌", use_container_width=True):
-                _commit_queue(0, current_item, current_iid, lang)
+                _commit_queue(0)
         with c2:
             if st.button("🔶🤔🔶", use_container_width=True):
-                _commit_queue(1, current_item, current_iid, lang)
+                _commit_queue(1)
         with c3:
             if st.button("✅🧐✅", use_container_width=True):
-                _commit_queue(2, current_item, current_iid, lang)
+                _commit_queue(2)
+
+def build_display_blocks(aligned_text):
+    """Batches consecutive non-target sentences for optimized rendering."""
+    if not aligned_text:
+        return []
+
+    display_blocks = []
+    source_batch = []
+
+    for unit in aligned_text:
+        if not unit['is_target']:
+            source_batch.append(unit['source'])
+        else:
+            if source_batch:
+                display_blocks.append({'type': 'batch', 'content': "\n\n".join(source_batch)})
+                source_batch = []
+            display_blocks.append({'type': 'unit', 'data': unit})
+    
+    if source_batch:
+        display_blocks.append({'type': 'batch', 'content': "\n\n".join(source_batch)})
+
+    return display_blocks
 
 # -------------------------------------------------------------------
 #  NUMERICAL FILE-NAV HELPERS 
@@ -324,28 +333,6 @@ def prev_number(number_list):
         number_list
     )
     st.session_state.force_state_reset = True
-
-
-
-
-@lru_cache(maxsize=2)
-def get_input_dict(input_files):
-    input_dict = defaultdict(list)
-    for file_name in input_files:
-        last_space_index = file_name.rfind(" ")
-        if last_space_index != -1:
-            key = file_name[:last_space_index]
-            num = file_name[last_space_index + 1:]
-            try:
-                num = int(num)
-            except ValueError:
-                num = None
-            input_dict[key].append(num)
-        else:
-            input_dict[file_name].append(None)
-    input_dict = {k: sorted(v) for k, v in input_dict.items()}
-    idx_map = {k: {v: i for i, v in enumerate(nums)} for k, nums in input_dict.items()}
-    return input_dict, idx_map
 
 
 def add_columns_style():
@@ -378,322 +365,177 @@ def main():
         st.session_state.language_model = LanguageLearningModel()
     model = st.session_state.language_model
 
-    lang_choices = ["Latin"]
-    
-    target_language = st.selectbox("Target language", lang_choices).lower()
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("Controls")
+        lang_choices = get_available_languages()
+        target_language = st.selectbox("Target language", lang_choices).lower()
+        
+        if st.button("Add/Refresh Files"):
+            with st.spinner(f"Processing files for {target_language}..."):
+                prepare(target_language)
+            st.cache_data.clear()
+            st.rerun()
+        
+        st.header("Vocabulary")
+        display_vocabulary_stats(model, target_language)
 
+        st.header("Reset")
+        reset_choice = st.radio("Reset vocabulary for:", ["Current language", "All languages"], key="reset_radio")
+        if st.button("Reset Vocabulary"):
+            msg = model.reset_vocabulary(target_language if reset_choice == "Current language" else None)
+            st.sidebar.success(f"{msg}!")
+            st.rerun()
+
+    # --- View Toggle ---
     if "show_queue_view" not in st.session_state:
         st.session_state.show_queue_view = False
-
     if st.button("Study Queue" if not st.session_state.show_queue_view else "Back to Text"):
-        st.session_state.update({"show_queue_view": not st.session_state.show_queue_view, "force_state_reset": True})
-        if st.session_state.show_queue_view:
-            st.session_state.queue_source_revealed = False
-        else:
-            st.session_state.pop("iid_to_item_map", None)
-            st.session_state.pop("learning_queue_obj", None)
-            st.session_state.pop("learning_queue_target", None)
+        st.session_state.show_queue_view = not st.session_state.show_queue_view
+        # Clean up queue state when switching away
+        if not st.session_state.show_queue_view:
+            for k in ["learning_queue_obj", "learning_queue_target", "iid_to_item_map"]:
+                st.session_state.pop(k, None)
         st.rerun()
 
     if st.session_state.show_queue_view:
         queue_view(model, target_language)
         return
 
-    
-    
-    # build an index of the NDJSON
-    input_nd = Path("input") / f"{target_language}.ndjson"
-    if not input_nd.exists():
-        st.error(f"No {target_language}.ndjson.")
+    # --- TEXT VIEW ---
+    file_choices = get_files_for_language(target_language)
+    if not file_choices:
+        st.warning(f"No text files found for '{target_language}'. Add some via the sidebar.")
         return
 
-    # build per‐file index
-    files = tuple({ orjson.loads(line)["filename"]
-                    for line in input_nd.read_bytes().splitlines() })
-    input_dict, num_dict = get_input_dict(files)
-
-    if "current_file" not in st.session_state:
-        st.session_state.current_file = None
-    if "force_state_reset" not in st.session_state:
-        st.session_state.force_state_reset = False
-
-    # ---------------- file selector ----------------
+    # --- File and Chapter Selection (Preserving original UI) ---
     colA, colB = st.columns([5, 2])
     with colA:
-        selected_file = st.selectbox("Select a file to read", input_dict.keys())
+        selected_file = st.selectbox("Select a file to read", file_choices, key=f"file_sel_{target_language}")
+    
     with colB:
-        nums = input_dict[selected_file]
-        unnumbered = nums == [None]
-        if unnumbered:
+        chapters = get_chapters_for_file(target_language, selected_file)
+        if "current_num_index" not in st.session_state:
             st.session_state.current_num_index = 0
-        else:
-            idx_map = num_dict[selected_file]
-            if (
-                "current_num_index" not in st.session_state
-                or st.session_state.current_file != selected_file
-            ):
+        
+        colL, colM, colR = st.columns([1, 3, 1], vertical_alignment="bottom")
+        with colL:
+            st.button("◀", on_click=partial(prev_number, chapters), use_container_width=True)
+        with colM:
+            # This logic ensures the index is valid if the list of chapters changes
+            if st.session_state.current_num_index >= len(chapters):
                 st.session_state.current_num_index = 0
-            colL, colM, colR = st.columns([1, 3, 1], vertical_alignment="bottom")
-            with colL:
-                st.button("◀", on_click=partial(prev_number, nums), use_container_width=True)
-            with colM:
-                st.session_state.current_num_index = idx_map[
-                    st.selectbox(
-                        "Select number",
-                        nums,
-                        index=st.session_state.current_num_index,
-                        on_change=lambda: st.session_state.__setitem__("force_state_reset", True),
-                        key="number-select-box"
-                    )
-                ]
-            with colR:
-                st.button("▶", on_click=partial(next_number, nums), use_container_width=True)
-
-    selected_stem = (
-        selected_file
-        if unnumbered
-        else f"{selected_file} {nums[st.session_state.current_num_index]}"
-    )
-
-    # -------------- reset session on file change --------------
-    if st.session_state.current_file != selected_file or st.session_state.force_state_reset:
-        for k in list(st.session_state.keys()):
-            if k not in [
-                "language_model",
-                "show_queue_view",
-                "current_file",
-                "current_num_index",
-                "force_state_reset",
-            ]:
-                del st.session_state[k]
-        st.session_state.update({
-            "current_file": selected_file,
-            "force_state_reset": False,
-        })
-        st.rerun()
-
-
-    # ----------------------------------------------------------------
-    # text-view logic
-    # ----------------------------------------------------------------
-    
-    if "aligned_text" not in st.session_state:
-        
-        text = [
-            (orjson.loads(line)["unit"], orjson.loads(line)["index"])
-            for line in input_nd.read_bytes().splitlines()
-            if orjson.loads(line)["filename"] == selected_stem
-        ]
-        aligned_text = [u[0] for u in sorted(text, key=lambda x: x[1])]
-        aligned_text_only_words = [u["words"] for u in aligned_text]
-        st.session_state.update({
-            "aligned_text": aligned_text,
-            "aligned_text_only_words": aligned_text_only_words,
-        })
-        
-    total_units = len(st.session_state.aligned_text)
-
-    # load existing log‐state via our new SQLite loader:
-    if "revealed" not in st.session_state:
-        rev, vis, revd, tgt = load_log_file(target_language, selected_stem)
-        st.session_state.update({
-            "revealed": rev,
-            "visible": vis,
-            "reviewed": revd,
-            "target_idx": tgt,
-        })
-    
-    if "to_replace_indices" not in st.session_state:
-        natural = get_natural_candidates(
-            model.get_or_create_model(target_language), st.session_state.aligned_text_only_words, st.session_state.target_idx
-        )
-        st.session_state.to_replace_indices = st.session_state.target_idx.union(natural)
-    
-    if "potential_natural_recount" not in st.session_state:
-        st.session_state.update({
-            "potential_natural_recount": False,
-            "potential_natural": 0,
-        })
-    
-    if st.session_state.potential_natural_recount:
-        st.session_state.update({
-            "potential_natural": len(
-                get_natural_candidates(
-                    model.get_or_create_model(target_language),
-                    st.session_state.aligned_text_only_words,
-                    st.session_state.to_replace_indices,
-                )
-            ),
-            "potential_natural_recount": False,
-        })
-    
-    display_vocabulary_stats(model, target_language)
-
-    # --- sidebar reset vocabulary ---
-    reset_options = ["Current language", "All languages"]
-    reset_choice = st.sidebar.radio("Reset vocabulary:", reset_options, index=0)
-    if st.sidebar.button("Reset Vocabulary"):
-        if st.session_state.get("confirm_reset", False):
-            msg = (
-                model.reset_vocabulary(target_language)
-                if reset_choice == "Current language"
-                else model.reset_vocabulary()
-            )
-            st.sidebar.success(f"{msg}!")
-            st.session_state.confirm_reset = False
-            st.rerun()
-        else:
-            st.session_state.confirm_reset = True
-            st.sidebar.warning(
-                f"Click again to confirm reset of {reset_choice.lower()}."
-            )
-    if st.session_state.get("confirm_reset", False):
-        if st.sidebar.button("Cancel Reset"):
-            st.session_state.confirm_reset = False
-            st.rerun()
-    
-    if st.sidebar.button("Add files"):
-        prepare(target_language.lower())
-        st.rerun()
-        
-    def save_current_session_state():
-        save_session_state(
-                target_language,
-                selected_stem,
-                st.session_state.revealed,
-                st.session_state.to_replace_indices,
-                st.session_state.visible,
-                st.session_state.reviewed,
-            )
-
-    # --- update target sentences button ---
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Update Target Sentences"):
-            naturals = get_natural_candidates(
-                model.get_or_create_model(target_language),
-                st.session_state.aligned_text_only_words,
-                st.session_state.to_replace_indices,
-            )
-            st.session_state.to_replace_indices.update(naturals)
-            st.session_state.potential_natural_recount = True
             
-            st.success(f"Added {len(naturals)} natural target sentences!")
-            st.rerun()
-
-    with col2:
-        tri = st.session_state.to_replace_indices
-        transformed = len(tri)
-        revealed_cnt = len(tri.intersection(st.session_state.revealed))
-        st.info(
-            f"Transformed: {transformed}/{total_units} | "
-            f"Revealed: {revealed_cnt}/{transformed} | "
-            f"New: {st.session_state.potential_natural}"
-        )
-
-    # --- reading text ---
-    st.subheader("Reading Text")
-    st.markdown(
-        """
-        <style>
-            .reviewed {color:#28a745;font-weight:bold;}
-            .unrevealed {color:#007bff;}
-            .revealed {color:#fd7e14;font-style:italic;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    tri = st.session_state.to_replace_indices
-    rev = st.session_state.revealed
-    revd = st.session_state.reviewed
-    vis = st.session_state.visible
-    at = st.session_state.aligned_text
-    
-    indexes_to_pass = set()
-    
-    for i, unit in enumerate(at):
-        if i in indexes_to_pass:
-            continue
-        if i in tri:
-            is_rev = i in rev
-            is_done = i in revd
-            show_src = vis.get(i, True) if is_rev else False
-
-            prefix, css = (
-                ("✓ ", "reviewed")
-                if is_done
-                else ("👁️ ", "revealed") if is_rev
-                else ("🔍 ", "unrevealed")
+            selected_chapter_index = st.selectbox(
+                "Select number", range(len(chapters)),
+                index=st.session_state.current_num_index,
+                format_func=lambda i: chapters[i],
+                on_change=lambda: st.session_state.__setitem__("force_state_reset", True),
+                key="number-select-box"
             )
+            st.session_state.current_num_index = selected_chapter_index
+        with colR:
+            st.button("▶", on_click=partial(next_number, chapters), use_container_width=True)
+    
+    selected_chapter = chapters[st.session_state.current_num_index]
+
+    # --- State Reset and Data Loading Logic ---
+    if (st.session_state.get("current_file") != selected_file or 
+        st.session_state.get("current_chapter") != selected_chapter or 
+        st.session_state.get("force_state_reset", False)):
+        
+        with st.spinner(f"Loading '{selected_file}' Chapter {selected_chapter}..."):
+            # Clear old state
+            for k in list(st.session_state.keys()):
+                if k.startswith(("visible_", "feedback_")):
+                    del st.session_state[k]
+
+            # Load fresh data from DB
+            aligned_text = load_text_and_progress(target_language, selected_file, selected_chapter)
+            
+            # Find natural candidates and update DB
+            all_words = [u['words'] for u in aligned_text]
+            current_targets = {u['idx'] for u in aligned_text if u['is_target']}
+            natural_candidates = get_natural_candidates(model.get_or_create_model(target_language), all_words, current_targets)
+            
+            if natural_candidates:
+                save_multiple_as_target(target_language, selected_file, selected_chapter, natural_candidates)
+                # Reload data to include newly marked targets
+                aligned_text = load_text_and_progress(target_language, selected_file, selected_chapter)
+
+            # Set session state for the new view
+            st.session_state.update({
+                "current_file": selected_file,
+                "current_chapter": selected_chapter,
+                "aligned_text": aligned_text,
+                "display_blocks": build_display_blocks(aligned_text),
+                "to_replace_indices": {u['idx'] for u in aligned_text if u['is_target']},
+                "revealed": {u['idx'] for u in aligned_text if u['is_revealed']},
+                "reviewed": {u['idx'] for u in aligned_text if u['is_reviewed']},
+                "visible": {},
+                "force_state_reset": False
+            })
+        st.rerun()
+
+    # --- Display Stats ---
+    total_units = len(st.session_state.aligned_text)
+    transformed = len(st.session_state.to_replace_indices)
+    revealed_cnt = len(st.session_state.revealed.intersection(st.session_state.to_replace_indices))
+    st.info(f"Transformed: {transformed}/{total_units} | Revealed: {revealed_cnt}/{transformed}")
+
+    # --- Reading Text (Optimized Rendering) ---
+    st.subheader(f"Reading: {selected_file} - Chapter {selected_chapter}")
+    st.markdown("""<style>.reviewed{color:#28a745;font-weight:bold;} .unrevealed{color:#007bff;} .revealed{color:#fd7e14;font-style:italic;}</style>""", unsafe_allow_html=True)
+    
+    for block in st.session_state.get("display_blocks", []):
+        if block['type'] == 'batch':
+            st.write(block['content'])
+        elif block['type'] == 'unit':
+            unit = block['data']
+            idx = unit['idx']
+            
+            is_rev = idx in st.session_state.revealed
+            is_done = idx in st.session_state.reviewed
+            show_src = st.session_state.visible.get(idx, False)
+
+            prefix, css = ("✓ ", "reviewed") if is_done else ("👁️ ", "revealed") if is_rev else ("🔍 ", "unrevealed")
 
             if not is_rev:
-                if st.button(f"{prefix}{unit['target']}", key=f"sent_{i}"):
-                    st.session_state.revealed.add(i)
-                    st.session_state.visible[i] = True
-                    save_current_session_state()
-                    st.session_state[f"feedback_{i}"] = True
+                if st.button(f"{prefix}{unit['target']}", key=f"sent_{idx}"):
+                    st.session_state.revealed.add(idx)
+                    st.session_state.visible[idx] = True
+                    save_progress_for_sentence(target_language, selected_file, selected_chapter, idx, 1, 1, 0)
                     st.rerun()
             else:
                 if show_src:
                     st.markdown(f"<div class='{css}'>{prefix}{unit['target']}</div>", unsafe_allow_html=True)
                     st.info(unit["source"])
-                    if st.button("Hide source", key=f"hide_{i}"):
-                        st.session_state.visible[i] = False
-                        save_current_session_state()
+                    if st.button("Hide source", key=f"hide_{idx}"):
+                        st.session_state.visible[idx] = False
                         st.rerun()
                 else:
-                    if st.button(f"{prefix}{unit['target']}", key=f"show_{i}"):
-                        st.session_state.visible[i] = True
-                        save_current_session_state()
+                    if st.button(f"{prefix}{unit['target']}", key=f"show_{idx}"):
+                        st.session_state.visible[idx] = True
                         st.rerun()
-
-                fb_key = f"feedback_{i}"
-                if show_src and not is_done and st.session_state.get(fb_key, False):
-                    def _commit(level):
-                        model.update_knowledge(unit["words"], target_language, level)
-                        st.session_state[fb_key] = False
-                        st.session_state.reviewed.add(i)
-                        save_current_session_state()
-                        st.session_state.potential_natural_recount = True
+                
+                if show_src and not is_done:
+                    def _commit(level, u=unit):
+                        model.update_knowledge(u["words"], target_language, level)
+                        st.session_state.reviewed.add(u['idx'])
+                        save_progress_for_sentence(target_language, selected_file, selected_chapter, u['idx'], 1, 1, 1)
                         st.rerun()
 
                     c1, c2, c3 = st.columns(3)
                     with c1:
-                        if st.button("❌😔❌", key=f"fb1_{i}", use_container_width=True):
+                        if st.button("❌😔❌", key=f"fb1_{idx}", use_container_width=True):
                             _commit(0)
                     with c2:
-                        if st.button("🔶🤔🔶", key=f"fb2_{i}", use_container_width=True):
+                        if st.button("🔶🤔🔶", key=f"fb2_{idx}", use_container_width=True):
                             _commit(1)
                     with c3:
-                        if st.button("✅🧐✅", key=f"fb3_{i}", use_container_width=True):
+                        if st.button("✅🧐✅", key=f"fb3_{idx}", use_container_width=True):
                             _commit(2)
                     st.divider()
-                    
-        else:
-            to_write = unit["source"]
-            indexes_to_pass = set()
-            for check_index, unit in enumerate(at[i+1:], i+1):
-                if check_index not in tri:
-                    to_write += f"\n\n{unit['source']}"
-                    indexes_to_pass.add(check_index)
-                else:
-                    break
-            st.write(to_write)
-
-    if st.button("I understood all other target sentences"):
-        mark = 0
-        for i in st.session_state.to_replace_indices:
-            if i not in st.session_state.revealed:
-                model.update_knowledge(st.session_state.aligned_text_only_words[i], target_language, 3)
-                st.session_state.revealed.add(i)
-                st.session_state.reviewed.add(i)
-                st.session_state.visible[i] = False
-                mark += 1
-        save_current_session_state()
-        st.success(f"Marked {mark} sentences as understood!")
-        st.rerun()
-
 
 # -------------------------------------------------------------------
 #  BOOTSTRAP

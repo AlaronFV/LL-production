@@ -68,7 +68,27 @@ void LearningQueue::_add_to_heap(int iid, int grp, float key) {
     iid_to_group[iid] = grp;
 }
 
-int LearningQueue::pop_next() {
+void LearningQueue::_pop_next() {
+    int grp_to_pop = -1;
+    if (_active_heap_sizes[2] > 0) grp_to_pop = 2;
+    else if (_active_heap_sizes[1] > 0) grp_to_pop = 1;
+    else if (_active_heap_sizes[0] > 0) grp_to_pop = 0;
+
+    if (grp_to_pop == -1) {
+        return;
+    }
+    
+    while (!_heaps[grp_to_pop].empty()) {
+        HeapItem top_item = _heaps[grp_to_pop].top();
+        _heaps[grp_to_pop].pop();
+
+        if (active_iids.count(top_item.iid)) {
+            return;
+        }
+    }
+}
+
+int LearningQueue::peek_next() {
     int grp_to_pop = -1;
     if (_active_heap_sizes[2] > 0) grp_to_pop = 2;
     else if (_active_heap_sizes[1] > 0) grp_to_pop = 1;
@@ -81,11 +101,12 @@ int LearningQueue::pop_next() {
     
     while (!_heaps[grp_to_pop].empty()) {
         HeapItem top_item = _heaps[grp_to_pop].top();
-        _heaps[grp_to_pop].pop();
 
         if (active_iids.count(top_item.iid)) {
             py::gil_scoped_acquire acquire;
             return top_item.iid;
+        } else {
+            _heaps[grp_to_pop].pop();
         }
     }
     
@@ -95,6 +116,7 @@ int LearningQueue::pop_next() {
 
 void LearningQueue::process_answer(int iid, int feedback_level) {
     if (!active_iids.count(iid)) return;
+    _pop_next();
 
     const auto& word_ids = item_word_ids.at(iid);
     double now_h = std::chrono::duration_cast<std::chrono::duration<double, std::ratio<3600>>>(

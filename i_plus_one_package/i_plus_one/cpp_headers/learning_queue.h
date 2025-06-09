@@ -22,7 +22,7 @@ public:
     LearningQueue(std::shared_ptr<VocabularyModel> model);
 
     void build_from_input(const py::list& items);
-    int pop_next();
+    int peek_next();
     void process_answer(int iid, int feedback_level);
     
     size_t size(int grp = -1) const;
@@ -35,7 +35,7 @@ private:
     void _add_to_heap(int iid, int grp, float key);
     float _promotion_potential(const std::vector<uint32_t>& word_ids, const std::vector<float>& eff_prof, double now_h);
     void _rescore_items(const std::unordered_set<int>& iids_to_rescore, double now_h);
-
+    void _pop_next();
     std::shared_ptr<VocabularyModel> tmodel;
 
     std::unordered_map<int, Heap> _heaps;
