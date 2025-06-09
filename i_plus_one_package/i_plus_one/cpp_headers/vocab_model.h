@@ -46,7 +46,7 @@ public:
     float predict_understanding(const std::vector<std::string>& words, double current_time_h);
     std::vector<float> get_effective_proficiency_by_str(const std::vector<std::string>& words);
 
-    // Core proficiency logic (operates on IDs)
+    // Core proficiency logic (operates on global IDs)
     void update_proficiency(const std::vector<uint32_t>& word_ids, float u_val, double now_h);
     std::vector<float> get_effective_proficiency_by_id(const std::vector<uint32_t>& word_ids);
 
@@ -63,19 +63,24 @@ public:
     const std::vector<float>& get_prof() const { return prof; }
     const std::vector<float>& get_vol() const { return vol; }
     const std::vector<float>& get_eff_prof() const { return eff_prof; }
-    const std::unordered_set<uint32_t>& get_processed_word_ids() const { return _processed_word_ids; }
+    // CHANGED: This now returns the mapping instead of the set
+    const std::unordered_map<uint32_t, uint32_t>& get_global_to_processed_map() const { return _global_to_processed_id; }
+
 
 private:
     friend class LearningQueue;
     friend std::tuple<int, std::vector<float>> predict_answer_for_queue(VocabularyModel& model, const std::vector<uint32_t>& word_ids, std::unordered_map<uint32_t, int>& words_map_v, std::unordered_map<uint32_t, std::unordered_set<int>>& words_map_i, std::unordered_map<int, float>& sent_map, int iid);
     friend int predict_answer_for_natural_candidates(VocabularyModel& model, const std::vector<uint32_t>& word_ids);
 
-    void _resize_arrays(size_t new_n);
+    // CHANGED: No longer needed, as we add to vectors directly.
+    // void _resize_arrays(size_t new_n); 
+    uint32_t _get_or_create_processed_id(uint32_t global_id, double now_h);
     float _eff_prof_formula(float p, float v) const;
     int _add_trace(const std::set<uint32_t>& word_ids, double timestamp_h, float activation, float decay_factor);
     float _decay_trace_activation(int trace_idx, double now_h);
     float _get_word_activation(uint32_t word_id, double now_h);
-    void _apply_decay_to_word_id(uint32_t wid, double now_h);
+    // CHANGED: Now takes a processed_id for direct array access
+    void _apply_decay_to_word_id(uint32_t processed_id, double now_h);
     void _process_due_word_decays(double now_h);
     void _process_due_trace_decays(double now_h);
     void _propagate(int source_trace_idx);
@@ -87,17 +92,21 @@ private:
     WordIndex idx;
     std::string _model_path;
     
-    // NEW: Set to track which words are "processed" and have entries in the arrays below
-    std::unordered_set<uint32_t> _processed_word_ids;
+    // REMOVED: Replaced by the mapping below
+    // std::unordered_set<uint32_t> _processed_word_ids;
 
-    // Core model arrays - their size is determined by the highest processed word ID
+    // ADDED: The new mapping system
+    std::unordered_map<uint32_t, uint32_t> _global_to_processed_id;
+    std::vector<uint32_t> _processed_to_global_id;
+
+    // Core model arrays - their size is now determined by the number of processed words
     std::vector<float> prof;
     std::vector<float> vol;
     std::vector<float> eff_prof;
     std::vector<uint32_t> encounters;
     std::vector<double> _word_last_decay_h;
 
-    // Trace-related data
+    // Trace-related data (still uses global IDs)
     std::vector<std::vector<uint32_t>> _trace_word_ids;
     std::vector<double> _trace_timestamps_h;
     std::vector<float> _trace_activations;
@@ -105,6 +114,7 @@ private:
     std::unordered_map<uint32_t, std::vector<int>> word_to_traces;
 
     // Decay scheduling queues
+    // CHANGED: The word decay queue will now store the DENSE processed_id
     std::priority_queue<DecayItem, std::vector<DecayItem>, DecayItemComparator> _word_decay_pq;
     std::priority_queue<DecayItem, std::vector<DecayItem>, DecayItemComparator> _trace_decay_pq;
 

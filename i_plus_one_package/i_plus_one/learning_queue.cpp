@@ -1,5 +1,6 @@
 #include "cpp_headers/learning_queue.h"
 #include "cpp_headers/llmodel.h"
+#include <string>
 #include <chrono>
 #include <stdexcept>
 #include <numeric>
@@ -23,19 +24,16 @@ void LearningQueue::build_from_input(const py::list& items) {
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     for (const auto& item_handle : items) {
-        py::dict item = item_handle.cast<py::dict>();
-        
-        std::vector<std::string> words = item["unit"]["words"].cast<std::vector<std::string>>();
-        _add_item_internal(iid_counter, words, now_h);
+        _add_item_internal(iid_counter, item_handle.cast<py::list>(), now_h);
         iid_counter++;
     }
 }
 
-void LearningQueue::_add_item_internal(int iid, const std::vector<std::string>& words, double now_h) {
+void LearningQueue::_add_item_internal(int iid, const py::list& words, double now_h) {
     std::vector<uint32_t> word_ids;
     word_ids.reserve(words.size());
     for (const auto& w : words) {
-        uint32_t wid = tmodel->get_idx().get_id(w);
+        uint32_t wid = tmodel->get_idx().get_id(w.cast<std::string>());
         word_ids.push_back(wid);
         word_id_to_iids[wid].push_back(iid);
     }

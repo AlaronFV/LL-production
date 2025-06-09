@@ -62,22 +62,32 @@ VocabularyModel::VocabularyModel(
     // Arrays are intentionally left empty until first processed word
 }
 
-void VocabularyModel::_resize_arrays(size_t new_n) {
-    size_t cur = prof.size();
-    if (new_n <= cur) return;
-
-    size_t size = cur == 0 ? 1 : cur;
-    while (size < new_n) size <<= 1;
-
-    prof.resize(size, proficiency_min);
-    vol.resize(size, 0.9f);
-    eff_prof.resize(size, 0.0f);
-    encounters.resize(size, 0);
-    _word_last_decay_h.resize(size, 0.0);
-}
-
 float VocabularyModel::_eff_prof_formula(float p, float v) const {
     return p * (1.0f - 0.3f * v);
+}
+
+uint32_t VocabularyModel::_get_or_create_processed_id(uint32_t global_id, double now_h) {
+    auto it = _global_to_processed_id.find(global_id);
+    if (it != _global_to_processed_id.end()) {
+        return it->second; // Return existing processed ID
+    }
+
+    // It's a new word to process, create a new dense ID
+    uint32_t new_processed_id = _processed_to_global_id.size();
+    _global_to_processed_id[global_id] = new_processed_id;
+    _processed_to_global_id.push_back(global_id);
+
+    // Expand the core vectors by one for the new word
+    prof.push_back(0.0f);
+    vol.push_back(0.0f); // Or some initial value
+    eff_prof.push_back(0.0f);
+    encounters.push_back(0);
+    _word_last_decay_h.push_back(now_h); // Initialize last decay time
+
+    // Add to decay queue with its new DENSE ID
+    _word_decay_pq.push({now_h + min_elapsed_h, new_processed_id});
+    
+    return new_processed_id;
 }
 
 void VocabularyModel::update_from_words(const std::vector<std::string>& words, float u_val) {
@@ -96,34 +106,35 @@ void VocabularyModel::update_from_words(const std::vector<std::string>& words, f
     update_proficiency(word_ids, u_val, now_h);
 }
 
-void VocabularyModel::update_proficiency(const std::vector<uint32_t>& word_ids, float u_val, double now_h) {
-    if (word_ids.empty()) return;
+void VocabularyModel::update_proficiency(const std::vector<uint32_t>& global_word_ids, float u_val, double now_h) {
+    if (global_word_ids.empty()) return;
 
-    // This is the ONLY place where words become "processed"
-    for (uint32_t wid : word_ids) {
-        if (_processed_word_ids.find(wid) == _processed_word_ids.end()) {
-            _resize_arrays(wid + 1);
-            _processed_word_ids.insert(wid);
-            // Add to decay queue only when first processed
-            _word_decay_pq.push({now_h + min_elapsed_h, wid});
-        }
+    // This is now the ONLY place where words become "processed"
+    std::set<uint32_t> unique_global_ids(global_word_ids.begin(), global_word_ids.end());
+    std::vector<uint32_t> processed_ids;
+    processed_ids.reserve(unique_global_ids.size());
+
+    for (uint32_t global_id : unique_global_ids) {
+        processed_ids.push_back(_get_or_create_processed_id(global_id, now_h));
     }
 
-    float expected = _predict_understanding_by_id(word_ids, now_h);
-    std::set<uint32_t> wids_set(word_ids.begin(), word_ids.end());
+    float expected = _predict_understanding_by_id(global_word_ids, now_h);
     
-    int new_trace_idx = _add_trace(wids_set, now_h, 1.0f, (0.1f - 0.05f * u_val));
+    int new_trace_idx = _add_trace(unique_global_ids, now_h, 1.0f, (0.1f - 0.05f * u_val));
     _propagate(new_trace_idx);
     _prune_traces();
 
     float err = u_val - expected;
     
-    for (uint32_t wid : wids_set) {
-        encounters[wid]++;
-        _word_last_decay_h[wid] = now_h;
-        float cp = prof[wid];
-        float cv = vol[wid];
-        float act = _get_word_activation(wid, now_h);
+    // CHANGED: Loop over the dense processed_ids for direct array access
+    for (uint32_t p_id : processed_ids) {
+        uint32_t g_id = _processed_to_global_id[p_id]; // Get global ID if needed for activation
+        
+        encounters[p_id]++;
+        _word_last_decay_h[p_id] = now_h;
+        float cp = prof[p_id];
+        float cv = vol[p_id];
+        float act = _get_word_activation(g_id, now_h); // Activation still uses global ID
         float lop = std::abs(u_val - cp);
         bool better = err > 0;
         float bu = learning_rate * std::min(std::abs(err), lop);
@@ -137,22 +148,23 @@ void VocabularyModel::update_proficiency(const std::vector<uint32_t>& word_ids, 
         float vd = 0.1f * cv * u_val * act * (1.0f - 0.5f * std::min(1.0f, std::abs(err)));
         cv -= vd;
         cv = std::max(0.1f, cv);
-        if (encounters[wid] > 3) {
+        if (encounters[p_id] > 3) {
             cv = std::max(0.1f, cv * 0.9f);
         }
         
-        prof[wid] = cp;
-        vol[wid] = cv;
-        eff_prof[wid] = _eff_prof_formula(cp, cv);
+        prof[p_id] = cp;
+        vol[p_id] = cv;
+        eff_prof[p_id] = _eff_prof_formula(cp, cv);
     }
 }
 
-std::vector<float> VocabularyModel::get_effective_proficiency_by_id(const std::vector<uint32_t>& word_ids) {
+std::vector<float> VocabularyModel::get_effective_proficiency_by_id(const std::vector<uint32_t>& global_word_ids) {
     std::vector<float> out;
-    out.reserve(word_ids.size());
-    for (uint32_t wid : word_ids) {
-        if (_processed_word_ids.count(wid)) {
-            out.push_back(eff_prof[wid]);
+    out.reserve(global_word_ids.size());
+    for (uint32_t global_id : global_word_ids) {
+        auto it = _global_to_processed_id.find(global_id);
+        if (it != _global_to_processed_id.end()) {
+            out.push_back(eff_prof[it->second]); // Use mapped ID
         } else {
             out.push_back(0.0365f); // Default for unprocessed words
         }
@@ -161,34 +173,33 @@ std::vector<float> VocabularyModel::get_effective_proficiency_by_id(const std::v
 }
 
 std::vector<float> VocabularyModel::get_effective_proficiency_by_str(const std::vector<std::string>& words) {
-    std::vector<uint32_t> word_ids;
-    word_ids.reserve(words.size());
+    std::vector<uint32_t> global_word_ids;
+    global_word_ids.reserve(words.size());
     for(const auto& w : words) {
-        // Use has_word to avoid adding new words to the index just by asking
         if(idx.has_word(w)) {
-            word_ids.push_back(idx.get_id(w));
+            global_word_ids.push_back(idx.get_id(w));
         } else {
-            // A non-existent word ID can be represented by a placeholder
-            word_ids.push_back(UINT32_MAX);
+            global_word_ids.push_back(UINT32_MAX); // Placeholder for unknown words
         }
     }
-    return get_effective_proficiency_by_id(word_ids);
+    return get_effective_proficiency_by_id(global_word_ids);
 }
 
-float VocabularyModel::_predict_understanding_by_id(const std::vector<uint32_t>& word_ids, double current_time_h) {
-    if (word_ids.empty()) return 0.0f;
+float VocabularyModel::_predict_understanding_by_id(const std::vector<uint32_t>& global_word_ids, double current_time_h) {
+    if (global_word_ids.empty()) return 0.0f;
 
     _process_due_word_decays(current_time_h);
     _process_due_trace_decays(current_time_h);
 
     float sum_p = 0.0f, min_p = 1.0f;
-    std::set<uint32_t> non_zero;
+    std::set<uint32_t> non_zero_global_ids;
     
-    for (uint32_t wid : word_ids) {
+    for (uint32_t global_id : global_word_ids) {
         float ep;
-        if (_processed_word_ids.count(wid)) {
-            ep = eff_prof[wid];
-            non_zero.insert(wid);
+        auto it = _global_to_processed_id.find(global_id);
+        if (it != _global_to_processed_id.end()) {
+            ep = eff_prof[it->second]; // Use mapped ID
+            non_zero_global_ids.insert(global_id);
         } else {
             ep = 0.0365f;
         }
@@ -196,9 +207,9 @@ float VocabularyModel::_predict_understanding_by_id(const std::vector<uint32_t>&
         sum_p += ep;
     }
 
-    size_t n = word_ids.size();
+    size_t n = global_word_ids.size();
     float avg_p = sum_p / n;
-    float ctx = _calculate_context_support(non_zero, n);
+    float ctx = _calculate_context_support(non_zero_global_ids, n);
 
     float lf = 1.0f / (1.0f + 0.1f * n);
     lf = std::min(0.5f, lf);
@@ -224,29 +235,31 @@ float VocabularyModel::predict_understanding(const std::vector<std::string>& wor
 }
 
 // --- Private methods for decay, propagation, etc. ---
-// These are included in full as requested.
 
 void VocabularyModel::_process_due_word_decays(double now_h) {
     while (!_word_decay_pq.empty() && _word_decay_pq.top().next_decay_time <= now_h) {
         DecayItem current_item = _word_decay_pq.top();
         _word_decay_pq.pop();
         
-        uint32_t wid = current_item.id_or_idx;
-        // Ensure word is still considered processed before decaying
-        if (_processed_word_ids.count(wid)) {
-            _apply_decay_to_word_id(wid, now_h);
-            _word_decay_pq.push({now_h + min_elapsed_h, wid});
+        // The ID from the queue is now the DENSE processed_id
+        uint32_t p_id = current_item.id_or_idx;
+        
+        // Ensure processed_id is still valid before decaying
+        if (p_id < _processed_to_global_id.size()) {
+            _apply_decay_to_word_id(p_id, now_h);
+            // Re-queue with the same dense processed_id
+            _word_decay_pq.push({now_h + min_elapsed_h, p_id});
         }
     }
 }
 
-void VocabularyModel::_apply_decay_to_word_id(uint32_t wid, double now_h) {
-    double elapsed = now_h - _word_last_decay_h[wid];
+void VocabularyModel::_apply_decay_to_word_id(uint32_t p_id, double now_h) {
+    double elapsed = now_h - _word_last_decay_h[p_id];
     if (elapsed <= min_elapsed_h) return;
 
-    float p = prof[wid];
-    float v = vol[wid];
-    float encf = 1.0f / (1.0f + 0.2f * encounters[wid]);
+    float p = prof[p_id];
+    float v = vol[p_id];
+    float encf = 1.0f / (1.0f + 0.2f * encounters[p_id]);
     encf = std::max(0.1f, encf);
 
     float dr = base_decay_rate * v * encf;
@@ -257,10 +270,10 @@ void VocabularyModel::_apply_decay_to_word_id(uint32_t wid, double now_h) {
     v += std::min(0.1f, 0.01f * (float)damt * (float)elapsed / 24.0f);
     v = std::min(v, 0.9f);
 
-    prof[wid] = p;
-    vol[wid] = v;
-    eff_prof[wid] = _eff_prof_formula(p, v);
-    _word_last_decay_h[wid] = now_h;
+    prof[p_id] = p;
+    vol[p_id] = v;
+    eff_prof[p_id] = _eff_prof_formula(p, v);
+    _word_last_decay_h[p_id] = now_h;
 }
 
 // ... other private methods like _add_trace, _get_word_activation, _propagate, _prune_traces, etc.
@@ -399,14 +412,21 @@ void VocabularyModel::save_fast(const std::string& path) {
     if (path.empty()) return;
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) throw std::runtime_error("Cannot open file for writing: " + path);
+
+    // --- Header ---
     f.write(MAGIC_STRING, sizeof(MAGIC_STRING) - 1);
     f.write(reinterpret_cast<const char*>(&MODEL_VERSION), sizeof(MODEL_VERSION));
-    uint32_t n_words = idx.size();
+    
+    // --- Sizes ---
+    uint32_t n_processed_words = _processed_to_global_id.size();
     uint32_t n_traces = _trace_timestamps_h.size();
-    uint32_t n_processed = _processed_word_ids.size();
-    f.write(reinterpret_cast<const char*>(&n_words), sizeof(n_words));
+    uint32_t n_total_words_in_idx = idx.size();
+
+    f.write(reinterpret_cast<const char*>(&n_processed_words), sizeof(n_processed_words));
     f.write(reinterpret_cast<const char*>(&n_traces), sizeof(n_traces));
-    f.write(reinterpret_cast<const char*>(&n_processed), sizeof(n_processed));
+    f.write(reinterpret_cast<const char*>(&n_total_words_in_idx), sizeof(n_total_words_in_idx));
+
+    // --- Parameters ---
     double params[] = {
         (double)learning_rate, (double)context_influence, (double)activation_threshold,
         (double)base_decay_rate, (double)proficiency_min, (double)proficiency_max,
@@ -414,12 +434,23 @@ void VocabularyModel::save_fast(const std::string& path) {
     };
     f.write(reinterpret_cast<const char*>(params), sizeof(params));
 
+    // --- Core Dense Vectors ---
     write_vec(f, prof);
     write_vec(f, vol);
     write_vec(f, eff_prof);
     write_vec(f, encounters);
     write_vec(f, _word_last_decay_h);
 
+    // --- Mapping Structures ---
+    write_vec(f, _processed_to_global_id);
+    uint32_t map_size = _global_to_processed_id.size();
+    f.write(reinterpret_cast<const char*>(&map_size), sizeof(map_size));
+    for(const auto& pair : _global_to_processed_id) {
+        f.write(reinterpret_cast<const char*>(&pair.first), sizeof(pair.first));   // global_id
+        f.write(reinterpret_cast<const char*>(&pair.second), sizeof(pair.second)); // processed_id
+    }
+
+    // --- WordIndex (i2w) ---
     const auto& i2w = idx.get_i2w();
     uint32_t i2w_size = i2w.size();
     f.write(reinterpret_cast<const char*>(&i2w_size), sizeof(i2w_size));
@@ -429,6 +460,7 @@ void VocabularyModel::save_fast(const std::string& path) {
         f.write(word.c_str(), len);
     }
 
+    // --- Trace Data ---
     if (n_traces > 0) {
         write_vec(f, _trace_timestamps_h);
         write_vec(f, _trace_activations);
@@ -440,7 +472,8 @@ void VocabularyModel::save_fast(const std::string& path) {
         }
     }
 
-    uint32_t map_size = word_to_traces.size();
+    // --- word_to_traces Map ---
+    map_size = word_to_traces.size();
     f.write(reinterpret_cast<const char*>(&map_size), sizeof(map_size));
     for(const auto& pair : word_to_traces) {
         f.write(reinterpret_cast<const char*>(&pair.first), sizeof(pair.first));
@@ -449,6 +482,7 @@ void VocabularyModel::save_fast(const std::string& path) {
         write_vec(f, pair.second);
     }
 
+    // --- Word Decay Priority Queue ---
     auto word_pq_copy = _word_decay_pq;
     uint32_t pq_size = word_pq_copy.size();
     f.write(reinterpret_cast<const char*>(&pq_size), sizeof(pq_size));
@@ -458,6 +492,7 @@ void VocabularyModel::save_fast(const std::string& path) {
         word_pq_copy.pop();
     }
 
+    // --- Trace Decay Priority Queue ---
     auto trace_pq_copy = _trace_decay_pq;
     pq_size = trace_pq_copy.size();
     f.write(reinterpret_cast<const char*>(&pq_size), sizeof(pq_size));
@@ -466,35 +501,61 @@ void VocabularyModel::save_fast(const std::string& path) {
         f.write(reinterpret_cast<const char*>(&item), sizeof(DecayItem));
         trace_pq_copy.pop();
     }
-    std::vector<uint32_t> processed_vec(_processed_word_ids.begin(), _processed_word_ids.end());
-    write_vec(f, processed_vec);
 }
 
 std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return std::make_shared<VocabularyModel>();
+    if (!f.is_open()) {
+        // Return a new, empty model if the file doesn't exist
+        return std::make_shared<VocabularyModel>();
+    }
+
+    // --- Header ---
     char magic_buf[sizeof(MAGIC_STRING) - 1];
     f.read(magic_buf, sizeof(magic_buf));
-    if (std::string(magic_buf, sizeof(magic_buf)) != MAGIC_STRING) throw std::runtime_error("Invalid model file format.");
+    if (std::string(magic_buf, sizeof(magic_buf)) != MAGIC_STRING) {
+        throw std::runtime_error("Invalid model file format.");
+    }
     uint32_t version;
     f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (version != MODEL_VERSION) throw std::runtime_error("Incompatible model version.");
-    uint32_t n_words, n_traces, n_processed;
-    f.read(reinterpret_cast<char*>(&n_words), sizeof(n_words));
+    if (version != MODEL_VERSION) {
+        throw std::runtime_error("Incompatible model version. Expected " + std::to_string(MODEL_VERSION) + ", got " + std::to_string(version));
+    }
+
+    // --- Sizes ---
+    uint32_t n_processed_words, n_traces, n_total_words_in_idx;
+    f.read(reinterpret_cast<char*>(&n_processed_words), sizeof(n_processed_words));
     f.read(reinterpret_cast<char*>(&n_traces), sizeof(n_traces));
-    f.read(reinterpret_cast<char*>(&n_processed), sizeof(n_processed));
+    f.read(reinterpret_cast<char*>(&n_total_words_in_idx), sizeof(n_total_words_in_idx));
+    
+    // --- Parameters ---
     double params[8];
     f.read(reinterpret_cast<char*>(params), sizeof(params));
     auto m = std::make_shared<VocabularyModel>(
-        params[0], params[1], params[2], params[3], params[4], params[5], 1.0, params[6], params[7]
+        params[0], params[3], params[1], params[2], params[4], params[5], 1.0, params[6], params[7]
     );
 
-    read_vec(f, m->prof, n_words);
-    read_vec(f, m->vol, n_words);
-    read_vec(f, m->eff_prof, n_words);
-    read_vec(f, m->encounters, n_words);
-    read_vec(f, m->_word_last_decay_h, n_words);
+    // --- Core Dense Vectors ---
+    read_vec(f, m->prof, n_processed_words);
+    read_vec(f, m->vol, n_processed_words);
+    read_vec(f, m->eff_prof, n_processed_words);
+    read_vec(f, m->encounters, n_processed_words);
+    read_vec(f, m->_word_last_decay_h, n_processed_words);
 
+    // --- Mapping Structures ---
+    read_vec(f, m->_processed_to_global_id, n_processed_words);
+    uint32_t map_size;
+    f.read(reinterpret_cast<char*>(&map_size), sizeof(map_size));
+    m->_global_to_processed_id.clear();
+    m->_global_to_processed_id.reserve(map_size);
+    for(uint32_t i=0; i<map_size; ++i) {
+        uint32_t key, val;
+        f.read(reinterpret_cast<char*>(&key), sizeof(key));
+        f.read(reinterpret_cast<char*>(&val), sizeof(val));
+        m->_global_to_processed_id[key] = val;
+    }
+
+    // --- WordIndex (i2w) ---
     uint32_t i2w_size;
     f.read(reinterpret_cast<char*>(&i2w_size), sizeof(i2w_size));
     m->idx.clear();
@@ -503,9 +564,11 @@ std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& p
         f.read(reinterpret_cast<char*>(&len), sizeof(len));
         std::string word(len, '\0');
         f.read(&word[0], len);
+        // Use add_word_for_load which correctly populates both i2w and w2i
         m->idx.add_word_for_load(word, i);
     }
 
+    // --- Trace Data ---
     if (n_traces > 0) {
         read_vec(f, m->_trace_timestamps_h, n_traces);
         read_vec(f, m->_trace_activations, n_traces);
@@ -518,9 +581,10 @@ std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& p
         }
     }
 
-    uint32_t map_size;
+    // --- word_to_traces Map ---
     f.read(reinterpret_cast<char*>(&map_size), sizeof(map_size));
     m->word_to_traces.clear();
+    m->word_to_traces.reserve(map_size);
     for(uint32_t i=0; i<map_size; ++i) {
         uint32_t key;
         f.read(reinterpret_cast<char*>(&key), sizeof(key));
@@ -531,6 +595,7 @@ std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& p
         m->word_to_traces[key] = vec;
     }
 
+    // --- Word Decay Priority Queue ---
     uint32_t pq_size;
     f.read(reinterpret_cast<char*>(&pq_size), sizeof(pq_size));
     for(uint32_t i=0; i<pq_size; ++i) {
@@ -539,6 +604,7 @@ std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& p
         m->_word_decay_pq.push(item);
     }
     
+    // --- Trace Decay Priority Queue ---
     f.read(reinterpret_cast<char*>(&pq_size), sizeof(pq_size));
     for(uint32_t i=0; i<pq_size; ++i) {
         DecayItem item;
@@ -547,9 +613,6 @@ std::shared_ptr<VocabularyModel> VocabularyModel::load_fast(const std::string& p
     }
 
     m->set_model_path(path);
-    std::vector<uint32_t> processed_vec;
-    read_vec(f, processed_vec, n_processed);
-    m->_processed_word_ids = std::unordered_set<uint32_t>(processed_vec.begin(), processed_vec.end());
     return m;
 }
 

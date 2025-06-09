@@ -43,10 +43,15 @@ std::tuple<int, std::vector<float>> predict_answer_for_queue(
         for (uint32_t wid : unknown_word_ids) {
             if (words_map_v.find(wid) == words_map_v.end()) {
                 float b = 0.1f, v = 0.9f;
-                // Check if the word is processed to get real values
-                if (model.get_processed_word_ids().count(wid)) {
-                    b = model.get_prof()[wid];
-                    v = model.get_vol()[wid];
+                const auto& g2p_map = model.get_global_to_processed_map();
+                auto it = g2p_map.find(wid);
+
+                if (it != g2p_map.end()) {
+                    // If the word is processed, get its dense processed_id.
+                    uint32_t p_id = it->second;
+                    // Access the vectors using the dense p_id.
+                    b = model.get_prof()[p_id];
+                    v = model.get_vol()[p_id];
                 }
                 words_map_v[wid] = promotion_times(b, v);
             }
@@ -128,9 +133,8 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
     const auto& eff_prof = model.get_eff_prof();
     const auto& prof = model.get_prof();
     const auto& vol = model.get_vol();
-    const auto& processed_ids = model.get_processed_word_ids();
+    size_t processed_count = prof.size();
     
-    size_t processed_count = processed_ids.size();
     stats["total_seen_words"] = model.get_idx().size();
     stats["processed_words"] = processed_count;
     stats["all_possible_knowledge"] = processed_count * 0.97;
@@ -145,10 +149,10 @@ std::map<std::string, double> get_vocabulary_statistics(VocabularyModel& model) 
     size_t semi_stable_count = 0;
     size_t volatile_count = 0;
 
-    for (uint32_t wid : processed_ids) {
-        float ep = eff_prof[wid];
-        float p = prof[wid];
-        float v = vol[wid];
+    for (size_t p_id = 0; p_id < processed_count; ++p_id) {
+        float ep = eff_prof[p_id];
+        float p = prof[p_id];
+        float v = vol[p_id];
 
         all_known_knowledge += ep;
         avg_prof_sum += p;

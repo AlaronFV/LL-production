@@ -1,7 +1,6 @@
 #ifndef I_PLUS_ONE_LEARNING_QUEUE_H
 #define I_PLUS_ONE_LEARNING_QUEUE_H
 
-#include <string>
 #include <vector>
 #include <queue>
 #include <unordered_map>
@@ -31,7 +30,7 @@ public:
 private:
     using Heap = std::priority_queue<HeapItem, std::vector<HeapItem>, HeapComparator>;
 
-    void _add_item_internal(int iid, const std::vector<std::string>& words, double now_h);
+    void _add_item_internal(int iid, const py::list& words, double now_h);
     std::pair<int, float> _score_and_group(int iid, const std::vector<uint32_t>& word_ids, double now_h);
     void _add_to_heap(int iid, int grp, float key);
     float _promotion_potential(const std::vector<uint32_t>& word_ids, const std::vector<float>& eff_prof, double now_h);

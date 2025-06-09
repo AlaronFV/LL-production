@@ -174,8 +174,10 @@ def scan_input(lang: str):
     Streams input/<lang>/<lang>.ndjson → a list of items
     {filename, index, unit}.
     """
-    items = []
+    items = {}
+    only_words = []
     nd = Path("input") / f"{lang}.ndjson"
+    counter = 0
     if not nd.exists():
         st.error(f"No input NDJSON for '{lang}'. Run migrate_data.py")
         return items
@@ -184,12 +186,16 @@ def scan_input(lang: str):
         rec = orjson.loads(line)
         stem = rec["filename"]
         idx = rec["index"]
-        unit = rec["unit"]
         _, _, reviewed, _ = load_log_file(lang, stem)
-        if idx in reviewed or not unit.get("words"):
+        if idx in reviewed or not rec["unit"].get("words"):
             continue
-        items.append({"filename": stem, "index": idx, "unit": unit})
-    return items
+        source = rec["unit"]["source"]
+        target = rec["unit"]["target"]
+        words = rec["unit"]["words"]
+        items[counter] = {"filename": stem, "index": idx, "source": source, "target": target}
+        only_words.append(words)
+        counter += 1
+    return items, only_words
 
 
 # -------------------------------------------------------------------
@@ -204,15 +210,15 @@ All knowledge: {stats['all_possible_knowledge']:.2f}"""
 Avg volatility: {stats['average_volatility']:.2f}\n
 Avg effective: {stats['average_effective_proficiency']:.2f}"""
     st.sidebar.write(f"""### {f"Vocabulary Statistics: {target_language}"}\n
-Seen vocabulary: {stats['total_seen_words']} words\n
-Tracked vocabulary: {stats['processed_words']} words\n
+Seen vocabulary: {stats['total_seen_words']:.0f} words\n
+Tracked vocabulary: {stats['processed_words']:.0f} words\n
 {knowledge_stats}\n
-{f"Well known: {stats['well_known']} words"}\n
-{f"Familiar: {stats['familiar']} words"}\n
-{f"Still learning: {stats['learning']} words"}\n
-{f"Stable knowledge: {stats['stable']} words"}\n
-{f"Semi-stable: {stats['semi_stable']} words"}\n
-{f"Volatile: {stats['volatile']} words"}\n
+{f"Well known: {stats['well_known']:.0f} words"}\n
+{f"Familiar: {stats['familiar']:.0f} words"}\n
+{f"Still learning: {stats['learning']:.0f} words"}\n
+{f"Stable knowledge: {stats['stable']:.0f} words"}\n
+{f"Semi-stable: {stats['semi_stable']:.0f} words"}\n
+{f"Volatile: {stats['volatile']:.0f} words"}\n
 {proficiency_stats}""")
 
 def _commit_queue(level, item_info, current_iid, lang):
@@ -234,7 +240,6 @@ def _commit_queue(level, item_info, current_iid, lang):
 # -------------------------------------------------------------------
 def queue_view(model_service, lang):
     st.subheader("Study Queue")
-    display_vocabulary_stats(model_service, lang)
 
     # (re)build queue if missing or language changed
     if "learning_queue_obj" not in st.session_state or st.session_state.learning_queue_target != lang:
@@ -244,18 +249,17 @@ def queue_view(model_service, lang):
         # Create the queue and pass the model instance to it
         q = LearningQueue(model_instance)
         
-        all_items = scan_input(lang.lower())
-        
-        # Build an iid -> item map for Python-side lookups
-        iid_map = {item["index"]: item for item in all_items}
+        all_items, only_words = scan_input(lang.lower())
 
-        q.build_from_input(all_items)
+        q.build_from_input(only_words)
         
         st.session_state.update({
             "learning_queue_obj": q,
             "learning_queue_target": lang,
-            "iid_to_item_map": iid_map, # Store the map
+            "iid_to_item_map": all_items, # Store the map
         })
+    
+    display_vocabulary_stats(model_service, lang)
 
     queue: LearningQueue = st.session_state.learning_queue_obj
     total = queue.size()
@@ -283,18 +287,17 @@ def queue_view(model_service, lang):
         st.error(f"Could not find item for iid {current_iid}. Rebuilding might be necessary.")
         return
 
-    unit = current_item["unit"]
 
     if "queue_source_revealed" not in st.session_state:
         st.session_state.queue_source_revealed = False
 
     st.markdown("### Current Unit")
-    if st.button(unit["target"], key="unit_target_btn"):
+    if st.button(current_item["target"], key="unit_target_btn"):
         st.session_state.queue_source_revealed = True
         st.rerun()
 
     if st.session_state.queue_source_revealed:
-        st.info(unit["source"])
+        st.info(current_item["source"])
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("❌😔❌", use_container_width=True):
