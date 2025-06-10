@@ -124,7 +124,6 @@ void LearningQueue::process_answer(int iid, int feedback_level) {
     ).count();
 
     tmodel->update_proficiency(word_ids, feedback_level / 2.0f, now_h);
-    tmodel->save_fast(tmodel->get_model_path());
 
     int old_grp = iid_to_group.at(iid);
     _active_heap_sizes[old_grp]--;

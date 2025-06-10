@@ -239,8 +239,6 @@ def queue_view(model_service, lang):
                 "iid_to_item_map": iid_to_item_map,
                 "queue_source_revealed": False,
             })
-    
-    display_vocabulary_stats(model_service, lang)
 
     queue: LearningQueue = st.session_state.learning_queue_obj
     total = queue.size()
@@ -275,10 +273,10 @@ def queue_view(model_service, lang):
         def _commit_queue(level):
             # Update learning queue
             st.session_state.learning_queue_obj.process_answer(current_iid, level)
-            
+            model_service.save_model(lang)
             # Mark as reviewed in the database
             save_progress_for_sentence(
-                lang, current_item['filename'], current_item['idx'],
+                lang, current_item['filename'], current_item['chapter'], current_item['idx'],
                 is_target=1, is_revealed=1, is_reviewed=1
             )
             
