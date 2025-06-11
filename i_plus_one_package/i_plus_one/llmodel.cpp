@@ -5,67 +5,6 @@
 
 namespace i_plus_one {
 
-std::tuple<int, std::vector<float>> predict_answer_for_queue(
-    VocabularyModel& model,
-    const std::vector<uint32_t>& word_ids,
-    std::unordered_map<uint32_t, int>& words_map_v,
-    std::unordered_map<uint32_t, std::unordered_set<int>>& words_map_i,
-    std::unordered_map<int, float>& sent_map,
-    int iid) {
-
-    std::set<uint32_t> unique_ids_set(word_ids.begin(), word_ids.end());
-    std::vector<uint32_t> unique_word_ids(unique_ids_set.begin(), unique_ids_set.end());
-
-    size_t n = unique_word_ids.size();
-    if (n == 0) {
-        return std::make_tuple(2, std::vector<float>{});
-    }
-
-    float thr = 0.3f;
-    size_t half = n / 2;
-
-    std::vector<float> effs = model.get_effective_proficiency_by_id(unique_word_ids);
-    
-    std::vector<uint32_t> unknown_word_ids;
-    for(size_t i = 0; i < n; ++i) {
-        if (effs[i] <= thr) {
-            unknown_word_ids.push_back(unique_word_ids[i]);
-        }
-    }
-
-    size_t unknown_cnt = unknown_word_ids.size();
-    size_t familiar = n - unknown_cnt;
-
-    if (unknown_cnt > half) {
-        float diff = static_cast<float>(unknown_cnt - half);
-        sent_map[iid] = word_ids.size() / diff;
-
-        for (uint32_t wid : unknown_word_ids) {
-            if (words_map_v.find(wid) == words_map_v.end()) {
-                float b = 0.1f, v = 0.9f;
-                const auto& g2p_map = model.get_global_to_processed_map();
-                auto it = g2p_map.find(wid);
-
-                if (it != g2p_map.end()) {
-                    // If the word is processed, get its dense processed_id.
-                    uint32_t p_id = it->second;
-                    // Access the vectors using the dense p_id.
-                    b = model.get_prof()[p_id];
-                    v = model.get_vol()[p_id];
-                }
-                words_map_v[wid] = promotion_times(b, v);
-            }
-            words_map_i[wid].insert(iid);
-        }
-    }
-
-    int group;
-    if (familiar < half) group = 0;
-    else if (familiar < n) group = 1;
-    else group = 2;
-
-    return std::make_tuple(group, effs);
-}
 
 int predict_answer_for_natural_candidates(
     VocabularyModel& model,
