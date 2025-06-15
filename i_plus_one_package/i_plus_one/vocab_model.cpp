@@ -8,6 +8,7 @@
 #include <chrono>
 #include <unordered_set>
 
+
 namespace i_plus_one {
 
 // --- Serialization Constants ---
@@ -112,7 +113,7 @@ void VocabularyModel::update_proficiency(const std::vector<uint32_t>& global_wor
     std::set<uint32_t> unique_global_ids(global_word_ids.begin(), global_word_ids.end());
 
     int new_trace_idx = _add_trace(unique_global_ids, now_h, 1.0f, (0.1f - 0.05f * u_val));
-    _propagate(new_trace_idx);
+    _propagate(new_trace_idx, now_h);
     _prune_traces();
 
     float expected = _predict_understanding_by_id(global_word_ids, now_h);
@@ -123,7 +124,6 @@ void VocabularyModel::update_proficiency(const std::vector<uint32_t>& global_wor
     for (uint32_t global_id : unique_global_ids) {
         processed_ids.push_back(_get_or_create_processed_id(global_id, now_h));
     }
-    
     float err = u_val - expected;
     
     // CHANGED: Loop over the dense processed_ids for direct array access
@@ -332,7 +332,7 @@ float VocabularyModel::_get_word_activation(uint32_t word_id, double now_h) {
     return std::min(1.0f, A / std::sqrt(cnt * 2.0f));
 }
 
-void VocabularyModel::_propagate(int source_trace_idx) {
+void VocabularyModel::_propagate(int source_trace_idx, double now_h) {
     if (source_trace_idx < 0 || static_cast<size_t>(source_trace_idx) >= _trace_activations.size()) return;
     std::deque<std::pair<int, float>> queue;
     queue.push_back({source_trace_idx, _trace_activations[source_trace_idx]});
@@ -358,8 +358,9 @@ void VocabularyModel::_propagate(int source_trace_idx) {
             if (tj_part < step) {
                 _trace_activations[neighbor_trace_idx] += step - tj_part;
                 _trace_activations[neighbor_trace_idx] = std::min(1.0f, _trace_activations[neighbor_trace_idx]);
+                _trace_timestamps_h[neighbor_trace_idx] = now_h;
+                if (step > propagation_threshold) queue.push_back({neighbor_trace_idx, step});
             }
-            if (step > propagation_threshold) queue.push_back({neighbor_trace_idx, step});
         }
     }
 }

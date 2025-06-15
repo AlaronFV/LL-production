@@ -274,12 +274,12 @@ def queue_view(model_service, lang):
             # Update learning queue
             st.session_state.learning_queue_obj.process_answer(current_iid, level)
             model_service.save_model(lang)
+
             # Mark as reviewed in the database
             save_progress_for_sentence(
                 lang, current_item['filename'], current_item['chapter'], current_item['idx'],
                 is_target=1, is_revealed=1, is_reviewed=1
             )
-            
             st.session_state.queue_source_revealed = False
             st.rerun()
         

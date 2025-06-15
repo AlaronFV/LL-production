@@ -83,7 +83,7 @@ private:
     void _apply_decay_to_word_id(uint32_t processed_id, double now_h);
     void _process_due_word_decays(double now_h);
     void _process_due_trace_decays(double now_h);
-    void _propagate(int source_trace_idx);
+    void _propagate(int source_trace_idx, double now_h);
     void _prune_traces();
     float _calculate_context_support(const std::unordered_set<uint32_t>& id_words, size_t n);
     float _predict_understanding_by_id(const std::vector<uint32_t>& word_ids, double current_time_h);

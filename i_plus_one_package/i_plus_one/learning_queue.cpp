@@ -8,6 +8,7 @@
 
 namespace i_plus_one {
 
+
 // --- Constructor ---
 LearningQueue::LearningQueue(std::shared_ptr<VocabularyModel> model) : tmodel(model) {
     if (!tmodel) {
@@ -61,7 +62,7 @@ void LearningQueue::process_answer(int iid, int feedback_level) {
 
     std::unordered_map<uint32_t, float> word_delta_map;
     std::vector<std::pair<int, int>> group_changes; // Stores {iid, old_group}
-
+    
     for (int dep_iid : first_order_dependents) {
         if (_active_iids.find(dep_iid) == _active_iids.end()) continue;
 
@@ -73,7 +74,6 @@ void LearningQueue::process_answer(int iid, int feedback_level) {
 
         if (old_group != new_group) {
             group_changes.push_back({dep_iid, old_group});
-            item.group = new_group;
         } else if (new_group == 0) {
             float old_sent_map_val = _sent_map.count(dep_iid) ? _sent_map.at(dep_iid) : 0.0f;
             
@@ -117,14 +117,14 @@ void LearningQueue::process_answer(int iid, int feedback_level) {
     }
     
     for (const auto& change : group_changes) {
-         int iid_to_rescore = change.first;
-         if (_active_iids.count(iid_to_rescore)) {
+        int iid_to_rescore = change.first;
+        if (_active_iids.count(iid_to_rescore)) {
             auto& item = _item_storage.at(iid_to_rescore);
             std::vector<float> eff_profs;
-            _get_group(item.word_ids, eff_profs, item.unknown_word_ids_cache);
+            int new_group = _get_group(item.word_ids, eff_profs, item.unknown_word_ids_cache);
             float new_key = _calculate_key(item, eff_profs, now_h);
-            _update_heap(item.iid, item.group, new_key);
-         }
+            _update_heap(item.iid, new_group, new_key);
+        }
     }
 
     // --- Phase 4: Self-Heal Caches & Graph ---
@@ -161,7 +161,7 @@ void LearningQueue::_pass1_ingest_and_group(const py::list& items) {
         }
         // Populate reverse index after all words are added
         for (uint32_t wid : std::set<uint32_t>(data.word_ids.begin(), data.word_ids.end())) {
-             _word_to_iids[wid].push_back(iid);
+            _word_to_iids[wid].push_back(iid);
         }
 
         std::vector<float> dummy_effs;
@@ -265,9 +265,9 @@ float LearningQueue::_get_promotion_potential(const ItemData& item) {
             float s = 0.0f;
             if (_word_to_iids.count(wid)) {
                 for (int iid_val : _word_to_iids.at(wid)) {
-                     if (_item_storage.at(iid_val).group == 0 && _sent_map.count(iid_val)) {
+                    if (_item_storage.at(iid_val).group == 0 && _sent_map.count(iid_val)) {
                         s += _sent_map.at(iid_val);
-                     }
+                    }
                 }
             }
             pot += s / std::max(1, _words_map_v.at(wid));
