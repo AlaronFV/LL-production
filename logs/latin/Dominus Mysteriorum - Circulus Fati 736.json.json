@@ -1,0 +1,1 @@
+{"revealed": [0, 1, 71, 7, 41, 72, 76, 79, 16, 82, 19, 20, 62], "target_indices": [0, 1, 7, 71, 41, 72, 76, 79, 16, 82, 19, 62, 20], "visible_states": {"0": false, "1": false, "7": false, "16": false, "19": false, "41": false, "62": false, "71": false, "72": false, "76": false, "79": false, "82": false, "20": false}, "reviewed": [0, 1, 7, 71, 41, 72, 76, 79, 16, 82, 19, 20, 62]}
